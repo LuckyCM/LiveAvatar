@@ -90,11 +90,11 @@ class FramePackMotioner(nn.Module):
                 list(self.zip_frame_buckets)[::-1], dim=2)  # 16,2,1,因为[::-1]反转,tuple(3),[1,16,16/2/1,48,32]
 
             # patchfy
-            clean_latents_post = self.proj(clean_latents_post).flatten(
+            clean_latents_post = self.proj(clean_latents_post.to(self.proj.weight.dtype)).flatten(
                 2).transpose(1, 2) #torch.Size([1, 384, 5120])
-            clean_latents_2x = self.proj_2x(clean_latents_2x).flatten(
+            clean_latents_2x = self.proj_2x(clean_latents_2x.to(self.proj.weight.dtype)).flatten(
                 2).transpose(1, 2) #torch.Size([1, 96, 5120])
-            clean_latents_4x = self.proj_4x(clean_latents_4x).flatten(
+            clean_latents_4x = self.proj_4x(clean_latents_4x.to(self.proj.weight.dtype)).flatten(
                 2).transpose(1, 2) #torch.Size([1, 96, 5120])
 
             if add_last_motion < 2 and self.drop_mode == "drop":

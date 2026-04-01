@@ -1,5 +1,8 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
+import math
+from typing import List, Optional, TypedDict
+import torch.nn.functional as F
 
 try:
     import flash_attn_interface
@@ -13,6 +16,20 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
+try:
+    import torch_npu
+    from torch_npu import (
+        npu_fused_infer_attention_score,
+        npu_fusion_attention,
+    )
+    no_npu = True
+    # from seed_models.utils import FlashAttentionKwargs as FlashAttentionKwargs
+    # from seed_models.utils import _flash_attention_forward as seed_flash_attention_forward
+    # from seed_models.utils import get_flash_attn_kwargs as get_flash_attn_kwargs
+    FLASH_ATTN_2_NPU_AVAILABLE = True
+except ModuleNotFoundError:
+    FLASH_ATTN_2_NPU_AVAILABLE = False
+
 import warnings
 
 __all__ = [
@@ -22,34 +39,76 @@ __all__ = [
 ]
 
 
-def cudnn_attention_forward_with_lse(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attn_mask = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    scale = None,
-) -> torch.Tensor:
-    # print(f"{q.shape=} {k.shape=}  {v.shape=}")
+# def cudnn_attention_forward_with_lse(
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     v: torch.Tensor,
+#     attn_mask = None,
+#     dropout_p: float = 0.0,
+#     is_causal: bool = False,
+#     scale = None,
+# ) -> torch.Tensor:
+#     # print(f"{q.shape=} {k.shape=}  {v.shape=}")
 
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    out = torch.ops.aten._scaled_dot_product_cudnn_attention(
-        q,
-        k,
-        v,
-        attn_bias=attn_mask,
-        compute_log_sumexp=True,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-        scale=scale,
-    )
-    if isinstance(out, tuple):
-        out = out[0]
-    out = out.transpose(1, 2).contiguous()
-    return out
+#     q = q.transpose(1, 2)
+#     k = k.transpose(1, 2)
+#     v = v.transpose(1, 2)
+#     out = torch.ops.aten._scaled_dot_product_cudnn_attention(
+#         q,
+#         k,
+#         v,
+#         attn_bias=attn_mask,
+#         compute_log_sumexp=True,
+#         dropout_p=dropout_p,
+#         is_causal=is_causal,
+#         scale=scale,
+#     )
+#     if isinstance(out, tuple):
+#         out = out[0]
+#     out = out.transpose(1, 2).contiguous()
+#     return out
+
+def make_attn_mask_from_lens(q_lens: torch.Tensor,
+                             k_lens: torch.Tensor,
+                             q_len: int,
+                             k_len: int,
+                             dtype: torch.dtype = torch.float32,
+                             device: torch.device | None = None,
+                             four_d: bool = True,
+                             neginf_safe: bool = True) -> torch.Tensor:
+    """
+    返回形状:
+      - four_d=False: [B, q_len, k_len]
+      - four_d=True : [B, 1, q_len, k_len]（部分实现更喜欢4D）
+
+    语义:
+      有效位置 = 0.0
+      无效位置 = -inf（或 -1e9 当 neginf_safe=False）
+    """
+    device = device or q_lens.device
+    B = q_lens.size(0)
+
+    # [B, q_len] / [B, k_len] 的有效标记
+    q_range = torch.arange(q_len, device=device).unsqueeze(0).expand(B, -1)   # [B, q_len]
+    k_range = torch.arange(k_len, device=device).unsqueeze(0).expand(B, -1)   # [B, k_len]
+    q_valid = q_range < q_lens.unsqueeze(1)                                    # [B, q_len] bool
+    k_valid = k_range < k_lens.unsqueeze(1)                                    # [B, k_len] bool
+
+    # -> [B, q_len, k_len]
+    mask = q_valid.unsqueeze(2) & k_valid.unsqueeze(1)
+
+    # # 生成 float mask: 有效=0, 无效=-inf / -1e9
+    # mask = torch.zeros((B, q_len, k_len), dtype=dtype, device=device)
+    # if neginf_safe:
+    #     neg_inf = torch.finfo(dtype).min  # 例如 bf16/fp16/fp32 下都是 -inf
+    # else:
+    #     neg_inf = -1e9
+
+    # mask = mask.masked_fill(~valid, neg_inf)
+
+    if four_d:
+        mask = mask.unsqueeze(1)  # [B, 1, q_len, k_len]
+    return mask
 
 
 def flash_attention(

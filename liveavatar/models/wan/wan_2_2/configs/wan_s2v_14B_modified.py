@@ -52,16 +52,8 @@ s2v_14B.transformer.motion_frames = 73
 s2v_14B.transformer.cond_dim = 16
 
 # inference
-s2v_14B.sample_neg_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+s2v_14B.sample_neg_prompt = "画面模糊，最差质量，画面模糊，细节模糊不清，情绪激动剧烈，手快速抖动，字幕，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 s2v_14B.drop_first_motion = True
 s2v_14B.sample_shift = 3
 s2v_14B.sample_steps = 40
 s2v_14B.sample_guide_scale = 4.5
-
-
-
-# causal s2v
-s2v_14B.sample_solver = 'unipc'
-s2v_14B.num_frames_per_block = 3
-s2v_14B.num_frames_latent = 12
-

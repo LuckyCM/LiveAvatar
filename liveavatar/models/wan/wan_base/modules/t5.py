@@ -475,11 +475,24 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
     ):
+        if device is None:
+            # Prefer Ascend NPU if available; otherwise fall back to CUDA/CPU.
+            try:
+                import torch_npu  # noqa: F401
+                device = torch.device('npu')
+            except Exception:
+                if torch.cuda.is_available():
+                    device = torch.device('cuda', torch.cuda.current_device())
+                else:
+                    device = torch.device('cpu')
+        elif not isinstance(device, torch.device):
+            device = torch.device(device)
+
         self.text_len = text_len
         self.dtype = dtype
         self.device = device

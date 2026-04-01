@@ -423,7 +423,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         seg_idx = [0, seg_idx, x.size(1)]
         e = e[0]  # [B, F, 6, 2, C]
         
-        modulation = self.modulation.unsqueeze(1).unsqueeze(3)  # [1, 6, 5120]->[1, 1, 6, 1, 5120]
+        modulation = self.modulation.unsqueeze(1).unsqueeze(3)  # [1, 6, 1536]->[1, 1, 6, 1, 1536]
         with amp.autocast(dtype=torch.float32):
             e = (modulation + e).chunk(6, dim=2) # [B,F,6,2,dim]->tuple(6)*[B,F,1,2,dim]
         assert e[0].dtype == torch.float32
@@ -435,7 +435,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
 
         for element in e: #element: [B,F,2,dim]
             if in_sink_forward:
-                element_noisy = element[:,:0,0] #torch.Size([1, 0, 5120])
+                element_noisy = element[:,:0,0] #torch.Size([1, 0, 1536])
             else:
                 element_noisy = element[:,:,0].repeat_interleave(int(frame_seqlen),dim=1) #[B,F*frame_seqlen,dim]
             element_cond = element[:,0:1,1].repeat(1,seq_lens-element_noisy.shape[1],1) #[B,cond_len,dim]
@@ -488,7 +488,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             self,
             cross_attn_type='t2v_cross_attn', #区别在于t2v有 crossattn_cache
             cond_dim=0,
-            audio_dim=5120,
+            audio_dim=1536,
             num_audio_token=4,
             enable_adain=False,
             adain_mode="attn_norm",
@@ -938,11 +938,11 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         bs = x.__len__()
         _,nf,height,width = x[0].shape
         nf = 0
-        x = [torch.zeros([1,5120,nf,height//2,width//2]).to(dtype=torch.bfloat16,device=x[0].device)]*bs #list(bs):torch.Size([1, 5120, 20, 24, 16])
+        x = [torch.zeros([1,1536,nf,height//2,width//2]).to(dtype=torch.bfloat16,device=x[0].device)]*bs #list(bs):torch.Size([1, 1536, 20, 24, 16])
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]) #tensor([[20, 24, 16]])
-        x = [u.flatten(2).transpose(1, 2) for u in x] # list , torch.Size([1, 7680, 5120])
+        x = [u.flatten(2).transpose(1, 2) for u in x] # list , torch.Size([1, 7680, 1536])
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
 
         original_grid_sizes = deepcopy(grid_sizes) #只包含 noisy_latent,cond(pose)加在上面不影响 grid_size
@@ -957,7 +957,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # ref and motion
         self.lat_motion_frames = motion_latents[0].shape[1] 
 
-        ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_latents] #torch.Size([1, 5120, 1, 24, 16])
+        ref = [self.patch_embedding(r.unsqueeze(0).to(self.patch_embedding.weight.dtype)) for r in ref_latents] #torch.Size([1, 1536, 1, 24, 16])
         batch_size = len(ref)
         height, width = ref[0].shape[3], ref[0].shape[4]
         ref_grid_sizes = [[
@@ -970,7 +970,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         ]  # the range 
                          ]#[[tensor([[30,  0,  0]]), tensor([[31, 24, 16]]), tensor([[ 1, 24, 16]])]]
 
-        ref = [r.flatten(2).transpose(1, 2) for r in ref]  # r: 1 c f h w  ->list,torch.Size([1, 384, 5120])
+        ref = [r.flatten(2).transpose(1, 2) for r in ref]  # r: 1 c f h w  ->list,torch.Size([1, 384, 1536])
         self.original_seq_len = seq_lens[0] #tensor(0)
         
         seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref],
@@ -978,7 +978,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         grid_sizes = grid_sizes + ref_grid_sizes #[[tensor([[0, 0, 0]]), tensor([[ 0, 24, 16]]), tensor([[ 0, 24, 16]])], [tensor([[30,  0,  0]]), tensor([[31, 24, 16]]), tensor([[ 1, 24, 16]])]]
 
-        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)] # list,torch.Size([1, 384, 5120])
+        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)] # list,torch.Size([1, 384, 1536])
 
         # Initialize masks to indicate noisy latent, ref latent, and motion latent.
         # However, at this point, only the first two (noisy and ref latents) are marked;
@@ -989,7 +989,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         ] # torch.Size([1, 8064]),[1,1..],稍后motion变成2
 
         # compute the rope embeddings for the input
-        x = torch.cat(x) # torch.Size([bs, 8064, 5120])
+        x = torch.cat(x) # torch.Size([bs, 8064, 1536])
 
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
@@ -1019,7 +1019,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             rollout_num_frames=current_start // frame_seqlen,
             sequence_current_start=sequence_current_start // frame_seqlen)
 
-        x = torch.cat(x, dim=0) #torch.Size([1, 960, 5120])
+        x = torch.cat(x, dim=0) #torch.Size([1, 960, 1536])
         self.pre_compute_freqs = torch.cat(self.pre_compute_freqs, dim=0)
         mask_input = torch.cat(mask_input, dim=0)
 
@@ -1033,6 +1033,8 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
             e0 = self.time_projection(e).unflatten(
                 1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
+            e = e.to(torch.float32)
+            e0 = e0.to(torch.float32)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
 
@@ -1175,27 +1177,27 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input
         ], #torch.Size([1, 25, 1024, 80])->torch.Size([1, 25, 1024, 153])
                                 dim=-1)
-        audio_emb_res = self.casual_audio_encoder(audio_input) # tuple(2),[0]:torch.Size([1, 39, 1, 5120]),[1]:torch.Size([1, 39, 5, 5120])
+        audio_emb_res = self.casual_audio_encoder(audio_input) # tuple(2),[0]:torch.Size([1, 39, 1, 1536]),[1]:torch.Size([1, 39, 5, 1536])
         audio_emb_res = tuple(aa.to(self.dtype) for aa in audio_emb_res)
         if self.enbale_adain:
-            audio_emb_global, audio_emb = audio_emb_res #audio_emb_global:torch.Size([1, 39, 1, 5120]),audio_emb:torch.Size([1, 39, 5, 5120])
+            audio_emb_global, audio_emb = audio_emb_res #audio_emb_global:torch.Size([1, 39, 1, 1536]),audio_emb:torch.Size([1, 39, 5, 1536])
             self.audio_emb_global = audio_emb_global[:,
-                                                     motion_frames[1]:].clone() #torch.Size([1, 20, 1, 5120])
+                                                     motion_frames[1]:].clone() #torch.Size([1, 20, 1, 1536])
         else:
             audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[:, motion_frames[1]:, :] #torch.Size([1, 20, 5, 5120])
+        self.merged_audio_emb = audio_emb[:, motion_frames[1]:, :] #torch.Size([1, 20, 5, 1536])
 
         device = self.patch_embedding.weight.device
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x] #list(bs):torch.Size([1, 5120, 20, 24, 16])
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x] #list(bs):torch.Size([1, 1536, 20, 24, 16])
         # cond states
-        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]#cond[0].shape:torch.Size([1, 5120, 20, 24, 16])
-        x = [x_ + pose for x_, pose in zip(x, cond)] #list(bs):torch.Size([1, 5120, 20, 24, 16])
+        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]#cond[0].shape:torch.Size([1, 1536, 20, 24, 16])
+        x = [x_ + pose for x_, pose in zip(x, cond)] #list(bs):torch.Size([1, 1536, 20, 24, 16])
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]) #tensor([[20, 24, 16]])
-        x = [u.flatten(2).transpose(1, 2) for u in x] # list , torch.Size([1, 7680, 5120])
+        x = [u.flatten(2).transpose(1, 2) for u in x] # list , torch.Size([1, 7680, 1536])
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
 
         original_grid_sizes = deepcopy(grid_sizes) #只包含 noisy_latent,cond(pose)加在上面不影响 grid_size
@@ -1210,7 +1212,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         self.original_seq_len = seq_lens[0] #tensor(7680)
 
         # compute the rope embeddings for the input
-        x = torch.cat(x) # torch.Size([bs, 8064, 5120])
+        x = torch.cat(x) # torch.Size([bs, 8064, 1536])
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
 
@@ -1247,6 +1249,8 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
             e0 = self.time_projection(e).unflatten(
                 1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
+            e = e.to(torch.float32)
+            e0 = e0.to(torch.float32)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
 
@@ -1391,27 +1395,27 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             audio_input[..., 0:1].repeat(1, 1, 1, int(motion_frames[0])), audio_input
         ], #torch.Size([1, 25, 1024, 80])->torch.Size([1, 25, 1024, 153])
                                 dim=-1)
-        audio_emb_res = self.casual_audio_encoder(audio_input) # tuple(2),[0]:torch.Size([1, 39, 1, 5120]),[1]:torch.Size([1, 39, 5, 5120])
+        audio_emb_res = self.casual_audio_encoder(audio_input) # tuple(2),[0]:torch.Size([1, 39, 1, 1536]),[1]:torch.Size([1, 39, 5, 1536])
         audio_emb_res = tuple(aa.to(self.dtype) for aa in audio_emb_res)
         if self.enbale_adain:
-            audio_emb_global, audio_emb = audio_emb_res #audio_emb_global:torch.Size([1, 39, 1, 5120]),audio_emb:torch.Size([1, 39, 5, 5120])
+            audio_emb_global, audio_emb = audio_emb_res #audio_emb_global:torch.Size([1, 39, 1, 1536]),audio_emb:torch.Size([1, 39, 5, 1536])
             self.audio_emb_global = audio_emb_global[:,
-                                                        motion_frames[1]:].clone() #torch.Size([1, 20, 1, 5120])
+                                                        motion_frames[1]:].clone() #torch.Size([1, 20, 1, 1536])
         else:
             audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[:, motion_frames[1]:, :] #torch.Size([1, 20, 5, 5120])
+        self.merged_audio_emb = audio_emb[:, motion_frames[1]:, :] #torch.Size([1, 20, 5, 1536])
 
         device = self.patch_embedding.weight.device
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x] #list(bs):torch.Size([1, 5120, 20, 24, 16])
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x] #list(bs):torch.Size([1, 1536, 20, 24, 16])
         # cond states
-        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]#cond[0].shape:torch.Size([1, 5120, 20, 24, 16])
-        x = [x_ + pose for x_, pose in zip(x, cond)] #list(bs):torch.Size([1, 5120, 20, 24, 16])
+        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]#cond[0].shape:torch.Size([1, 1536, 20, 24, 16])
+        x = [x_ + pose for x_, pose in zip(x, cond)] #list(bs):torch.Size([1, 1536, 20, 24, 16])
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]) #tensor([[20, 24, 16]])
-        x = [u.flatten(2).transpose(1, 2) for u in x] # list , torch.Size([1, 7680, 5120])
+        x = [u.flatten(2).transpose(1, 2) for u in x] # list , torch.Size([1, 7680, 1536])
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
 
         original_grid_sizes = deepcopy(grid_sizes) #只包含 noisy_latent,cond(pose)加在上面不影响 grid_size
@@ -1436,7 +1440,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         ]  # the range
                             ]#[[tensor([[30,  0,  0]]), tensor([[31, 24, 16]]), tensor([[ 1, 24, 16]])]]
 
-        ref = [r.flatten(2).transpose(1, 2) for r in ref]  # r: 1 c f h w  ->list,torch.Size([1, 384, 5120])
+        ref = [r.flatten(2).transpose(1, 2) for r in ref]  # r: 1 c f h w  ->list,torch.Size([1, 384, 1536])
         self.original_seq_len = seq_lens[0] #tensor(7680)
 
         seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref],
@@ -1444,7 +1448,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         grid_sizes = grid_sizes + ref_grid_sizes #[[tensor([[0, 0, 0]]), tensor([[20, 24, 16]]), tensor([[20, 24, 16]])], [tensor([[30,  0,  0]]), tensor([[31, 24, 16]]), tensor([[ 1, 24, 16]])]]
 
-        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)] # list,torch.Size([1, 8064, 5120])
+        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)] # list,torch.Size([1, 8064, 1536])
 
         # Initialize masks to indicate noisy latent, ref latent, and motion latent.
         # However, at this point, only the first two (noisy and ref latents) are marked;
@@ -1457,7 +1461,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             mask_input[i][:, self.original_seq_len:] = 1 #noisy为 0，ref 为 1
 
         # compute the rope embeddings for the input
-        x = torch.cat(x) # torch.Size([bs, 8064, 5120])
+        x = torch.cat(x) # torch.Size([bs, 8064, 1536])
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
         self.pre_compute_freqs = rope_precompute(

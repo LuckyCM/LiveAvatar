@@ -143,7 +143,7 @@ class CausalConv1d(nn.Module):
             **kwargs)
 
     def forward(self, x):
-        x = F.pad(x, self.time_causal_padding, mode=self.pad_mode)
+        x = F.pad(x.to(torch.float32), self.time_causal_padding, mode=self.pad_mode).to(x.dtype)
         return self.conv(x)
 
 

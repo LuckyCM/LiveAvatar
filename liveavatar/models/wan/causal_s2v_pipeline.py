@@ -27,7 +27,6 @@ from safetensors import safe_open
 from torchvision import transforms
 from tqdm import tqdm
 from peft import LoraConfig, get_peft_model
-import subprocess
 from diffusers import FlowMatchEulerDiscreteScheduler
 from .wan_2_2.distributed.fsdp import shard_model
 from .wan_2_2.distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
@@ -182,6 +181,9 @@ class WanS2V:
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
         self.noise_model.num_frame_per_block = self.num_frames_per_block
+        self._num_heads = self.noise_model.num_heads
+        self._head_dim = self.noise_model.dim // self.noise_model.num_heads
+        self._cond_cache_size = 4096
 
         if not self.is_training:
             self.audio_encoder = AudioEncoder(
@@ -624,8 +626,8 @@ class WanS2V:
 
         for layer_idx in range(self.noise_model.num_layers):
             layer_cache = {
-                "k": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, kv_cache_size, self._num_heads, self._head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, self._num_heads, self._head_dim], dtype=dtype, device=device),
             }
             
             if not self.offload_kv_cache and hasattr(self, 'shared_cond_cache') and self.shared_cond_cache is not None:
@@ -635,15 +637,24 @@ class WanS2V:
             else:
                 # Resolution-dependent; grow on demand in model forward.
                 cond_init_len = int(getattr(self, "cond_cache_init_len", 1))
-                layer_cache["cond_k"] = torch.zeros([batch_size, cond_init_len, 40, 128], dtype=dtype, device=device)
-                layer_cache["cond_v"] = torch.zeros([batch_size, cond_init_len, 40, 128], dtype=dtype, device=device)
+                cond_init_len = max(1, min(cond_init_len, self._cond_cache_size))
+                layer_cache["cond_k"] = torch.zeros(
+                    [batch_size, cond_init_len, self._num_heads, self._head_dim],
+                    dtype=dtype,
+                    device=device,
+                )
+                layer_cache["cond_v"] = torch.zeros(
+                    [batch_size, cond_init_len, self._num_heads, self._head_dim],
+                    dtype=dtype,
+                    device=device,
+                )
                 layer_cache["cond_end"] = torch.tensor([0], dtype=torch.long, device=device)
             
             kv_cache1.append(layer_cache)
 
         self.kv_cache1[str(gpu_id)] = kv_cache1  # always store the clean cache
     
-    def _move_kv_cache_to_working_gpu(self,moved_id, gpu_id=0):
+    def _move_kv_cache_to_working_gpu(self, moved_id, gpu_id=0):
         """
         Move the KV cache to the working GPU.
         move_id : "1","2","3","4"
@@ -670,8 +681,8 @@ class WanS2V:
 
         for _ in range(self.noise_model.num_layers):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, 0, self._num_heads, self._head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, 0, self._num_heads, self._head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
 
@@ -1003,10 +1014,12 @@ class WanS2V:
                     if not self.offload_kv_cache:
                         self.shared_cond_cache = []
                         cond_device = self._device_str(0)
+                        cond_init_len = int(getattr(self, "cond_cache_init_len", self._cond_cache_size))
+                        cond_init_len = max(1, min(cond_init_len, self._cond_cache_size))
                         for _ in range(self.noise_model.num_layers):
                             self.shared_cond_cache.append({
-                                "cond_k": torch.zeros([1, 2800, 40, 128], dtype=self.param_dtype, device=cond_device),
-                                "cond_v": torch.zeros([1, 2800, 40, 128], dtype=self.param_dtype, device=cond_device),
+                                "cond_k": torch.zeros([1, cond_init_len, self._num_heads, self._head_dim], dtype=self.param_dtype, device=cond_device),
+                                "cond_v": torch.zeros([1, cond_init_len, self._num_heads, self._head_dim], dtype=self.param_dtype, device=cond_device),
                                 "cond_end": torch.tensor([0], dtype=torch.long, device=cond_device)
                             })
                     else:

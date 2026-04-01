@@ -57,7 +57,14 @@ def calculate_fid(gen_frames, real_frames):
             cv2.imwrite(f'{real_img_path}/{i}.png', real_frame[..., ::-1])
 
         # 使用pytorch-fid库，提取帧并计算FID
-        score = fid_score.calculate_fid_given_paths([gen_img_path, real_img_path], batch_size=16, device='cuda' if torch.cuda.is_available() else 'cpu', dims=2048)
+        from liveavatar.utils.device_backend import env_device_backend, resolve_device_backend
+        backend = resolve_device_backend(env_device_backend())
+        score = fid_score.calculate_fid_given_paths(
+            [gen_img_path, real_img_path],
+            batch_size=16,
+            device=backend,
+            dims=2048,
+        )
     return score
 
 def trans(x):

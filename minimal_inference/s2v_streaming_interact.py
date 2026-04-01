@@ -1,4 +1,9 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import torch
+import torch.distributed as dist
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+
 import argparse
 import copy
 import logging
@@ -12,15 +17,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings('ignore')
 
 import random
-
-import torch
-import torch.distributed as dist
 from PIL import Image
 
 # import liveavatar.models.wan.wan_2_2 as wan
 from liveavatar.models.wan.wan_2_2.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from liveavatar.models.wan.wan_2_2.distributed.util import init_distributed_group
-from liveavatar.models.wan.wan_2_2.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
+# from liveavatar.models.wan.wan_2_2.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from liveavatar.models.wan.wan_2_2.utils.utils import merge_video_audio, save_video, str2bool
 from liveavatar.utils.args_config import parse_args_for_training_config as training_config_parser
 from liveavatar.utils.router.synthesize_audio import merge_multiple_audio_files
@@ -34,6 +36,20 @@ from liveavatar.utils.device_backend import (
 )
 
 EXAMPLE_PROMPT = {
+    "s2v-1.3B": {
+        "prompt":
+            "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
+        "image":
+            "examples/boy.jpg",
+        "audio":
+            "examples/boy.wav",
+        "tts_prompt_audio":
+            "examples/fashion_blogger.wav",
+        "tts_prompt_text":
+            "希望你以后能够做的比我还好呦。",
+        "tts_text":
+            "收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐，笑容如花儿般绽放。"
+    },
     "s2v-14B": {
         "prompt":
             "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
@@ -385,6 +401,8 @@ def generate(args, training_settings):
     # Device/backend
     prefer_backend = parse_device_backend_arg(args.device_backend) if getattr(args, "device_backend", None) else env_device_backend()
     device_backend = resolve_device_backend(prefer_backend)
+    if world_size == 1:
+        local_rank = 0
     device = local_rank if device_backend in ("cuda", "npu") else 0
     _init_logging(rank)
 
@@ -393,11 +411,13 @@ def generate(args, training_settings):
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     set_device(local_rank, device_backend)
-    dist.init_process_group(
-        backend=default_dist_backend(device_backend),
-        init_method="env://",
-        rank=rank,
-        world_size=world_size)
+    # Do not initialize distributed for single-process runs.
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend=default_dist_backend(device_backend),
+            init_method="env://",
+            rank=rank,
+            world_size=world_size)
     if world_size > 1:
         assert world_size >= 5, "At least 5 GPUs are supported for distributed inference."
         assert args.num_gpus_dit == 4, "Only 4 GPUs are supported for distributed inference."
@@ -422,21 +442,21 @@ def generate(args, training_settings):
         assert False, "Sequence parallel is not supported."
         init_distributed_group()
 
-    if args.use_prompt_extend:
-        if args.prompt_extend_method == "dashscope":
-            prompt_expander = DashScopePromptExpander(
-                model_name=args.prompt_extend_model,
-                task=args.task,
-                is_vl=args.image is not None)
-        elif args.prompt_extend_method == "local_qwen":
-            prompt_expander = QwenPromptExpander(
-                model_name=args.prompt_extend_model,
-                task=args.task,
-                is_vl=args.image is not None,
-                device=rank)
-        else:
-            raise NotImplementedError(
-                f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+    # if args.use_prompt_extend:
+    #     if args.prompt_extend_method == "dashscope":
+    #         prompt_expander = DashScopePromptExpander(
+    #             model_name=args.prompt_extend_model,
+    #             task=args.task,
+    #             is_vl=args.image is not None)
+    #     elif args.prompt_extend_method == "local_qwen":
+    #         prompt_expander = QwenPromptExpander(
+    #             model_name=args.prompt_extend_model,
+    #             task=args.task,
+    #             is_vl=args.image is not None,
+    #             device=rank)
+    #     else:
+    #         raise NotImplementedError(
+    #             f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
 
     cfg = WAN_CONFIGS[args.task]
 

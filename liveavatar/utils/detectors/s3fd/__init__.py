@@ -8,6 +8,9 @@ from .nets import S3FDNet
 from .box_utils import nms_
 import torch.nn.functional as F
 
+from liveavatar.utils.device_backend import autocast as device_autocast
+from liveavatar.utils.device_backend import env_device_backend, resolve_device_backend
+
 PATH_WEIGHT = '/tmp/pretrained/sfd_face.pth'
 if not os.path.exists(PATH_WEIGHT):
     raise ValueError(f"SFD_ckpt not found in {PATH_WEIGHT}! download it from https://drive.google.com/file/d/1KafnHz7ccT-3IyddBsL5yi2xGtxAKypt")
@@ -16,14 +19,17 @@ img_mean = np.array([104., 117., 123.])[:, np.newaxis, np.newaxis].astype('float
 
 class S3FD():
 
-    def __init__(self, device='cuda'):
+    def __init__(self, device=None):
 
         tstamp = time.time()
-        self.device = device
+        if device is None:
+            backend = resolve_device_backend(env_device_backend())
+            device = backend
+        self.device = torch.device(device)
 
         print('[S3FD] loading with', self.device)
-        self.net = S3FDNet(device=self.device).to(self.device)
-        state_dict = torch.load(PATH_WEIGHT, map_location=self.device, weights_only=False)
+        self.net = S3FDNet(device=str(self.device)).to(self.device)
+        state_dict = torch.load(PATH_WEIGHT, map_location=str(self.device), weights_only=False)
         self.net.load_state_dict(state_dict)
         self.net.eval()
         print('[S3FD] finished loading (%.4f sec)' % (time.time() - tstamp))
@@ -49,7 +55,7 @@ class S3FD():
                 y = self.net(x)
 
                 detections = y.data
-                scale = torch.Tensor([w, h, w, h])
+                scale = torch.Tensor([w, h, w, h]).to(self.device)
 
                 for i in range(detections.size(1)):
                     j = 0
@@ -67,14 +73,14 @@ class S3FD():
 
     def detect_faces_batch(self, images, conf_th=0.8, scale=1.0):
         b, _, h, w = images.shape
-        scale = torch.Tensor([w, h, w, h]) / scale
+        scale = (torch.Tensor([w, h, w, h]) / scale).to(self.device)
 
         bboxes_ = []
         with torch.no_grad():
             images = torch.flip(images, [1])
             images = images - self.img_mean[None, :, None, None]
             images = torch.flip(images, [1])
-            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=True):
+            with device_autocast(images.device.type, dtype=torch.float16, enabled=(images.device.type != 'cpu')):
                 y = self.net(images)
 
             for i_img in range(b):

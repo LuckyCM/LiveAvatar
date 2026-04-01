@@ -62,8 +62,10 @@ class FP8LinearFunction(torch.autograd.Function):
 
 
 class FP8ScaleLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, dtype=torch.float16, device="cuda"):
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.float16, device=None):
         super().__init__()
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         factory_kwargs = {"dtype": dtype, "device": device}
         self.weight = nn.Parameter(torch.empty(out_features, in_features, **factory_kwargs))
         if bias:
