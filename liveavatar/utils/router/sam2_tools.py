@@ -11,6 +11,9 @@ import cv2
 import numpy as np
 import supervision as sv
 import torch
+
+from liveavatar.utils.device_backend import empty_cache as device_empty_cache
+from liveavatar.utils.device_backend import env_device_backend, resolve_device_backend
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor
@@ -237,7 +240,7 @@ def process_single_video(video_path, output_path, video_predictor, face_analyzer
             os.remove(temp_video_path)
             print(f"Removed temporary video: {temp_video_path}")
         
-        torch.cuda.empty_cache()
+        device_empty_cache(resolve_device_backend(env_device_backend()))
         gc.collect()
 
         print(f"Video {base_name} processing complete!")

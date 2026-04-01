@@ -44,6 +44,9 @@ from .wan_2_2.utils.fm_solvers import (
 from .wan_2_2.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ...utils.load_weight_utils import load_state_dict
 from liveavatar.utils.router.utils import process_masks_to_routing_logits
+from liveavatar.utils.device_backend import autocast as device_autocast
+from liveavatar.utils.device_backend import empty_cache as device_empty_cache
+from liveavatar.utils.device_backend import synchronize as device_synchronize
 from .inference_utils import STREAMING_VAE
 if STREAMING_VAE:
     from .wan_2_2.modules.vae_streaming import WanVAE as Wan2_1_VAE
@@ -654,9 +657,10 @@ class WanS2V:
             kv_cache1.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=device),
-                "cond_k": torch.zeros([batch_size, 3000, 40, 128], dtype=dtype, device=device), #hard-coded for 720*400 resolution
-                "cond_v": torch.zeros([batch_size, 3000, 40, 128], dtype=dtype, device=device), #hard-coded for 720*400 resolution
-                "cond_end": torch.tensor([0], dtype=torch.long, device=device) #dynamically updated 2640
+                # Resolution-dependent; grow on demand in model forward.
+                "cond_k": torch.zeros([batch_size, int(getattr(self, "cond_cache_init_len", 1)), 40, 128], dtype=dtype, device=device),
+                "cond_v": torch.zeros([batch_size, int(getattr(self, "cond_cache_init_len", 1)), 40, 128], dtype=dtype, device=device),
+                "cond_end": torch.tensor([0], dtype=torch.long, device=device) #dynamically updated
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
@@ -736,8 +740,15 @@ class WanS2V:
     ):
         # ------------------------------------Step 1: prepare conditional inputs--------------------------------------
         
+        size_arg = generate_size
+        if isinstance(size_arg, str) and "*" in size_arg:
+            try:
+                size_arg = tuple(int(x) for x in size_arg.split("*", 1))
+            except Exception:
+                size_arg = None
+
         size = self.get_gen_size(
-            size=None,
+            size=size_arg,
             max_area=max_area,
             ref_image_path=ref_image_path,
             pre_video_path=None)
@@ -805,7 +816,7 @@ class WanS2V:
 
         #--------------------------------------Step 2: generate--------------------------------------
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                device_autocast(self.device.type, dtype=self.param_dtype, enabled=(self.device.type != "cpu")),
                 torch.no_grad(),
         ):
             out = []
@@ -823,6 +834,9 @@ class WanS2V:
                                         ) // 4 - lat_motion_frames
                     target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
                     frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
+                    # Conditioning length depends on resolution; pre-allocate conservatively and
+                    # allow dynamic growth in model forward.
+                    self.cond_cache_init_len = max(1, int(frame_seq_length * self.num_frames_per_block))
                     clip_noise = [
                         torch.randn(
                             16,
@@ -1010,10 +1024,10 @@ class WanS2V:
                             self.vae.stream_decode(decode_latents)
                         decode_latents = block_latents.unsqueeze(0)
 
-                        torch.cuda.synchronize()
+                        device_synchronize(self.device.type)
                         vae_wait_start = time.time()
                         image = torch.stack(self.vae.stream_decode(decode_latents))
-                        torch.cuda.synchronize()
+                        device_synchronize(self.device.type)
                         vae_wait_time = time.time() - vae_wait_start
                         print(f"[VAE] decoding for data from GPU {self.src_gpu}: {vae_wait_time:.4f}s")
                         

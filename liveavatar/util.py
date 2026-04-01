@@ -19,6 +19,8 @@ import random
 import torch
 import os
 
+from liveavatar.utils.device_backend import set_device as set_runtime_device
+
 
 def launch_distributed_job(backend: str = "nccl"):
     rank = int(os.environ["RANK"])
@@ -33,7 +35,10 @@ def launch_distributed_job(backend: str = "nccl"):
         init_method = f"tcp://{host}:{port}"
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
                             init_method=init_method, timeout=timedelta(minutes=30))
-    torch.cuda.set_device(local_rank)
+    if backend == "hccl":
+        set_runtime_device(local_rank, "npu")
+    elif backend == "nccl":
+        set_runtime_device(local_rank, "cuda")
 
 
 def set_seed(seed: int, deterministic: bool = False):
@@ -49,7 +54,14 @@ def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "npu"):
+        try:
+            if torch.npu.is_available():
+                torch.npu.manual_seed_all(seed)
+        except Exception:
+            pass
 
     if deterministic:
         torch.use_deterministic_algorithms(True)

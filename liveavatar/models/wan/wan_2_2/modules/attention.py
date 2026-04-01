@@ -82,7 +82,11 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    if q.device.type != 'cuda':
+        raise RuntimeError(
+            f"flash_attention requires CUDA tensors, got device={q.device.type!r}"
+        )
+    assert q.size(-1) <= 256
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
@@ -177,11 +181,29 @@ def attention(
     fa_version=None,
 ):
     def cudnn_require():
+        if q.device.type != 'cuda':
+            return False
         if window_size != (-1, -1):
             return False
         if not q.shape[-1] <= 256:
             return False
         return True
+
+    # Ascend NPU (torch_npu) should prefer SDPA (maps to Fusion Attention)
+    # even if flash_attn is installed.
+    if q.device.type != 'cuda':
+        if q_lens is not None or k_lens is not None:
+            warnings.warn(
+                'Padding mask is disabled when using scaled_dot_product_attention. '
+                'It can have a significant impact on performance.'
+            )
+        q_ = q.transpose(1, 2).to(dtype)
+        k_ = k.transpose(1, 2).to(dtype)
+        v_ = v.transpose(1, 2).to(dtype)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_, k_, v_, attn_mask=None, is_causal=causal, dropout_p=dropout_p
+        )
+        return out.transpose(1, 2).contiguous()
 
     if cudnn_require():
         return cudnn_attention_forward_with_lse(q, k, v, is_causal=causal)

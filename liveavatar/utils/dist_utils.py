@@ -6,6 +6,11 @@ def initialize_distributed(args):
     """Initialize torch.distributed."""
     if torch.distributed.is_initialized():
         return True
+
+    # Single-process runs should not initialize distributed.
+    if getattr(args, "world_size", 1) == 1:
+        args.rank = 0
+        return False
     # the automatic assignment of devices has been moved to arguments.py
     if args.device == "cpu":
         pass

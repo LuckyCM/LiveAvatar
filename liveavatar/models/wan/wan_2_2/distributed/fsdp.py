@@ -40,4 +40,6 @@ def free_model(model):
             _free_storage(m._handle.flat_param.data)
     del model
     gc.collect()
-    torch.cuda.empty_cache()
+    device_empty_cache(resolve_device_backend(env_device_backend()))
+from liveavatar.utils.device_backend import empty_cache as device_empty_cache
+from liveavatar.utils.device_backend import env_device_backend, resolve_device_backend

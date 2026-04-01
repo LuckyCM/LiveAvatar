@@ -5,7 +5,10 @@ from copy import deepcopy
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+try:
+    import torch.npu.amp as amp  # type: ignore
+except Exception:  # pragma: no cover
+    import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -46,6 +49,30 @@ from liveavatar.models.wan.wan_2_2.distributed import util as dist_util
 from liveavatar.models.wan.wan_2_2.distributed.util import all_to_all,pad_chunk
 import torch.distributed as dist
 from liveavatar.models.wan.inference_utils import conditional_compile
+
+
+def _round_up(x: int, multiple: int = 128) -> int:
+    return int((x + multiple - 1) // multiple * multiple)
+
+
+def _ensure_kv_cache_len(kv_cache: dict, key: str, required_len: int) -> None:
+    """Ensure kv_cache[key] has sequence dim >= required_len.
+
+    Expands in-place (preserves existing prefix) to avoid resolution hardcodes.
+    """
+    if required_len <= 0:
+        return
+    t = kv_cache.get(key, None)
+    if not isinstance(t, torch.Tensor):
+        return
+    if t.shape[1] >= required_len:
+        return
+    new_len = _round_up(required_len, multiple=128)
+    new_t = torch.zeros(
+        [t.shape[0], new_len, *t.shape[2:]], device=t.device, dtype=t.dtype
+    )
+    new_t[:, : t.shape[1]] = t
+    kv_cache[key] = new_t
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -140,7 +167,6 @@ def sp_attn_forward_s2v(self,
             sp_full_length = k.shape[1]
             # global_seg_idx = [seg_idx[0],seg_idx[1]*sp_size,seg_idx[2]*sp_size]
             # global_seg_idx = seg_idx
-            # 这里序列长度为3375 （720*400），并不能被sp_size整除，因此这里推导的gloabl_length肯定会出错，暂时硬编码为3375 hard-code flag;不过实测虽然长度错了计算结果似乎没区别，但是empty_like出来的内存有不确定性。暂时这样
             
             if seg_idx[1]-seg_idx[0] > 0:
                 global_seg_idx = [0,global_length,global_length]
@@ -164,20 +190,27 @@ def sp_attn_forward_s2v(self,
                                 kv_cache["cond_v"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank]
                                 ],dim=1
                                 ),
-                    k_lens=torch.tensor(current_start+global_seg_idx[1]-global_seg_idx[0]+int(kv_cache["cond_end"])).repeat(b),
+                    k_lens=torch.tensor(
+                        current_start + (global_seg_idx[1] - global_seg_idx[0]) + int(kv_cache["cond_end"]),
+                        device=q.device,
+                        dtype=torch.int32,
+                    ).repeat(b),
                     window_size=self.window_size
                     )
             elif global_seg_idx[2]-global_seg_idx[1] > 0: #prefill cond caching
                 # assert False, "not implemented for prefill sp"
-                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), global_seg_idx[2]-global_seg_idx[1])
-                kv_cache["cond_k"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank] = k[:,global_seg_idx[1]:global_seg_idx[2]]
-                kv_cache["cond_v"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank] = v[:,global_seg_idx[1]:global_seg_idx[2]]
+                required_cond_len = int(global_seg_idx[2] - global_seg_idx[1])
+                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), required_cond_len)
+                _ensure_kv_cache_len(kv_cache, "cond_k", int(kv_cache["cond_end"]))
+                _ensure_kv_cache_len(kv_cache, "cond_v", int(kv_cache["cond_end"]))
+                kv_cache["cond_k"][:, :required_cond_len, head_start_rank:head_end_rank] = k[:,global_seg_idx[1]:global_seg_idx[2]]
+                kv_cache["cond_v"][:, :required_cond_len, head_start_rank:head_end_rank] = v[:,global_seg_idx[1]:global_seg_idx[2]]
 
                 x = flash_attention(
                     q=q,
                     k=k,
                     v=v,
-                    k_lens=torch.tensor(global_seg_idx[2]-global_seg_idx[1]).repeat(b),
+                    k_lens=torch.tensor(required_cond_len, device=q.device, dtype=torch.int32).repeat(b),
                     window_size=self.window_size)
 
             else:
@@ -318,22 +351,29 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                                 kv_cache["cond_v"][:, :active_cond_cache_size]
                                 ],dim=1
                                 ),
-                    k_lens=torch.tensor(active_kv_cache_size - active_kv_cache_start + active_cond_cache_size).repeat(b),
+                    k_lens=torch.tensor(
+                        active_kv_cache_size - active_kv_cache_start + active_cond_cache_size,
+                        device=q.device,
+                        dtype=torch.int32,
+                    ).repeat(b),
                     window_size=self.window_size
                     )
             elif seg_idx[2]-seg_idx[1] > 0: #prefill cond caching
                 roped_query = causal_rope_apply_cond(
                     q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
-                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), seg_idx[2]-seg_idx[1])
-                kv_cache["cond_k"][:, :int(kv_cache["cond_end"])] = k[:,seg_idx[1]:seg_idx[2]]
-                kv_cache["cond_v"][:, :int(kv_cache["cond_end"])] = v[:,seg_idx[1]:seg_idx[2]]
+                required_cond_len = int(seg_idx[2] - seg_idx[1])
+                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), required_cond_len)
+                _ensure_kv_cache_len(kv_cache, "cond_k", int(kv_cache["cond_end"]))
+                _ensure_kv_cache_len(kv_cache, "cond_v", int(kv_cache["cond_end"]))
+                kv_cache["cond_k"][:, :required_cond_len] = k[:,seg_idx[1]:seg_idx[2]]
+                kv_cache["cond_v"][:, :required_cond_len] = v[:,seg_idx[1]:seg_idx[2]]
                 x = attention(
                     q=roped_query[:,seg_idx[1]:seg_idx[2]],
                     k=causal_rope_apply_cond(
                             k, grid_sizes, freqs
                         ).type_as(v)[:,:int(kv_cache["cond_end"])],
                     v=kv_cache["cond_v"][:, :int(kv_cache["cond_end"])],
-                    k_lens=torch.tensor(int(kv_cache["cond_end"])).repeat(b),
+                    k_lens=torch.tensor(int(kv_cache["cond_end"]), device=q.device, dtype=torch.int32).repeat(b),
                     window_size=self.window_size
                 )
             else:
@@ -526,12 +566,11 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(45000, d - 4 * (d // 6)),
-            rope_params(45000, 2 * (d // 6)),
-            rope_params(45000, 2 * (d // 6))
-        ],
-                               dim=1).to("cuda")
+        self._rope_head_dim = d
+        self._rope_freqs_cache = {}
+        # Build RoPE freqs lazily on the correct device and only up to the
+        # required index range derived from the current input resolution.
+        self.freqs = None
         self.rope_cache = {}
 
         # initialize weights
@@ -591,6 +630,44 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         self.block_mask = None
         self.num_frame_per_block = 1 #只影响训练时causal mask的行为，推理无关
+
+    def _rope_max_index_from_grid_sizes(self, grid_sizes) -> int:
+        """Upper-bound RoPE index needed by `rope_precompute`."""
+        max_idx = 0
+        if not isinstance(grid_sizes, list):
+            grid_sizes = [grid_sizes]
+        for g in grid_sizes:
+            if isinstance(g, list) and len(g) >= 3:
+                start = g[0]
+                total = g[2]
+                if isinstance(start, torch.Tensor) and isinstance(total, torch.Tensor):
+                    max_idx = max(max_idx, int((start.abs() + total.abs()).max().item()))
+                for t in g[:3]:
+                    if isinstance(t, torch.Tensor):
+                        max_idx = max(max_idx, int(t.abs().max().item()))
+            elif isinstance(g, torch.Tensor):
+                max_idx = max(max_idx, int(g.abs().max().item()))
+        return max_idx
+
+    def _get_rope_freqs(self, grid_sizes, device: torch.device) -> torch.Tensor:
+        max_idx = self._rope_max_index_from_grid_sizes(grid_sizes)
+        max_len = max(1, int(max_idx) + 1)
+        key = (device.type, device.index, max_len)
+        cached = self._rope_freqs_cache.get(key, None)
+        if isinstance(cached, torch.Tensor):
+            return cached
+
+        d = self._rope_head_dim
+        freqs = torch.cat(
+            [
+                rope_params(max_len, d - 4 * (d // 6), device=device),
+                rope_params(max_len, 2 * (d // 6), device=device),
+                rope_params(max_len, 2 * (d // 6), device=device),
+            ],
+            dim=1,
+        )
+        self._rope_freqs_cache[key] = freqs
+        return freqs
 
 
     def enable_gradient_checkpointing(self):
@@ -918,9 +995,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             1), self.num_heads, self.dim // self.num_heads
         self.rope_cache['cond_shape'] = x.detach().view(b, s, n, d).shape
         self.rope_cache['grid_sizes'] = grid_sizes
+        rolled_grid_sizes = rollout_grid_sizes(grid_sizes, current_start // frame_seqlen)
         self.pre_compute_freqs = rope_precompute(
-            # x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None, start_frame=current_start // frame_seqlen )  #TODO: start_frame = current_start // hw
-            x.detach().view(b, s, n, d), rollout_grid_sizes(grid_sizes,current_start // frame_seqlen), self.freqs, start=None )
+            x.detach().view(b, s, n, d),
+            rolled_grid_sizes,
+            self._get_rope_freqs(rolled_grid_sizes, x.device),
+            start=None,
+        )
 
         x = [u.unsqueeze(0) for u in x]
         self.pre_compute_freqs = [
@@ -1133,16 +1214,26 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
 
+        rolled_grid_sizes = rollout_grid_sizes(grid_sizes, current_start // frame_seqlen)
         self.pre_compute_freqs = rope_precompute( #可以做一点加速这里大概0.06秒，其中0.45秒是计算（cpu串行可以挪到gpu），分配内存0.15秒可以cache
-            x.detach().view(b, s, n, d), rollout_grid_sizes(grid_sizes,current_start // frame_seqlen), self.freqs, start=None )
+            x.detach().view(b, s, n, d),
+            rolled_grid_sizes,
+            self._get_rope_freqs(rolled_grid_sizes, x.device),
+            start=None,
+        )
 
         import random
         relative_dist = random.randint(4, 30)
         # relative_dist = 30
         start_idx = 30-relative_dist
         num_frames_cond_rollout = max(0, current_start // frame_seqlen - start_idx)
-        cond_pre_compute_freqs = rope_precompute( 
-            torch.empty(self.rope_cache['cond_shape']).type_as(x), rollout_grid_sizes(self.rope_cache['grid_sizes'],num_frames_cond_rollout), self.freqs, start=None )
+        rolled_cond_grid_sizes = rollout_grid_sizes(self.rope_cache['grid_sizes'], num_frames_cond_rollout)
+        cond_pre_compute_freqs = rope_precompute(
+            torch.empty(self.rope_cache['cond_shape']).type_as(x),
+            rolled_cond_grid_sizes,
+            self._get_rope_freqs(rolled_cond_grid_sizes, x.device),
+            start=None,
+        )
         # print(f"current_grid_size:{rollout_grid_sizes(grid_sizes,current_start // frame_seqlen)}")
         # print(f"cond grid_size:{rollout_grid_sizes(self.rope_cache['grid_sizes'],num_frames_cond_rollout)}")
         mask_input = torch.zeros([1,x.shape[1]], dtype=torch.long, device=x.device)

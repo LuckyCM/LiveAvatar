@@ -45,6 +45,9 @@ from .wan_2_2.utils.fm_solvers import (
 from .wan_2_2.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ...utils.load_weight_utils import load_state_dict 
 from liveavatar.utils.router.utils import process_masks_to_routing_logits
+from liveavatar.utils.device_backend import autocast as device_autocast
+from liveavatar.utils.device_backend import empty_cache as device_empty_cache
+from liveavatar.utils.device_backend import synchronize as device_synchronize
 
 
 
@@ -630,8 +633,10 @@ class WanS2V:
                 layer_cache["cond_v"] = self.shared_cond_cache[layer_idx]["cond_v"]
                 layer_cache["cond_end"] = self.shared_cond_cache[layer_idx]["cond_end"]
             else:
-                layer_cache["cond_k"] = torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=device)
-                layer_cache["cond_v"] = torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=device)
+                # Resolution-dependent; grow on demand in model forward.
+                cond_init_len = int(getattr(self, "cond_cache_init_len", 1))
+                layer_cache["cond_k"] = torch.zeros([batch_size, cond_init_len, 40, 128], dtype=dtype, device=device)
+                layer_cache["cond_v"] = torch.zeros([batch_size, cond_init_len, 40, 128], dtype=dtype, device=device)
                 layer_cache["cond_end"] = torch.tensor([0], dtype=torch.long, device=device)
             
             kv_cache1.append(layer_cache)
@@ -752,8 +757,15 @@ class WanS2V:
         """
         # ------------------------------------Step 1: prepare conditional inputs--------------------------------------
 
+        size_arg = generate_size
+        if isinstance(size_arg, str) and "*" in size_arg:
+            try:
+                size_arg = tuple(int(x) for x in size_arg.split("*", 1))
+            except Exception:
+                size_arg = None
+
         size = self.get_gen_size(
-            size=None,
+            size=size_arg,
             max_area=max_area,
             ref_image_path=ref_image_path,
             pre_video_path=None)
@@ -794,24 +806,28 @@ class WanS2V:
             audio_emb = torch.cat(audio_embs, dim=0)
 
             # Process SAM2 and generate routing_logits if video path is provided
-            print(f"rank {dist.get_rank()} processing SAM2")
             input_video_for_sam2 = input_video_for_sam2 if input_video_for_sam2 is not None else ref_image_path
             routing_logits = None
-            rank = dist.get_rank()
-            
-            # Broadcast video path to all ranks
-            if rank == 0:
-                video_path_bytes = input_video_for_sam2.encode('utf-8')
-                path_length = torch.tensor([len(video_path_bytes)], dtype=torch.long, device=self.device)
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(f"rank {rank} processing SAM2")
+
+            # Broadcast video path to all ranks (distributed), otherwise use local value.
+            if dist.is_initialized():
+                if rank == 0:
+                    video_path_bytes = input_video_for_sam2.encode('utf-8')
+                    path_length = torch.tensor([len(video_path_bytes)], dtype=torch.long, device=self.device)
+                else:
+                    path_length = torch.tensor([0], dtype=torch.long, device=self.device)
+                dist.broadcast(path_length, src=0)
+                if rank == 0:
+                    path_tensor = torch.ByteTensor(list(video_path_bytes)).to(self.device)
+                else:
+                    path_tensor = torch.zeros(path_length.item(), dtype=torch.uint8, device=self.device)
+                dist.broadcast(path_tensor, src=0)
+                video_path = path_tensor.cpu().numpy().tobytes().decode('utf-8')
             else:
-                path_length = torch.tensor([0], dtype=torch.long, device=self.device)
-            dist.broadcast(path_length, src=0)
-            if rank == 0:
-                path_tensor = torch.ByteTensor(list(video_path_bytes)).to(self.device)
-            else:
-                path_tensor = torch.zeros(path_length.item(), dtype=torch.uint8, device=self.device)
-            dist.broadcast(path_tensor, src=0)
-            video_path = path_tensor.cpu().numpy().tobytes().decode('utf-8')
+                video_path = input_video_for_sam2
+
             print(f"Rank {rank}: video_path: {video_path}")
             
             parent_dir = os.path.dirname(video_path)
@@ -829,9 +845,11 @@ class WanS2V:
                 except subprocess.CalledProcessError as e:
                     print(f"Rank {rank}: SAM2 processing failed: {e}")
                     raise e
-                dist.barrier()
+                if dist.is_initialized():
+                    dist.barrier()
             else:
-                dist.barrier()
+                if dist.is_initialized():
+                    dist.barrier()
             
             base_name = os.path.basename(video_path).split(".")[0]
             tracking_mask_results_dir = os.path.join(
@@ -940,7 +958,7 @@ class WanS2V:
 
         #--------------------------------------Step 2: generate--------------------------------------
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                device_autocast(self.device.type, dtype=self.param_dtype, enabled=(self.device.type != "cpu")),
                 torch.no_grad(),
         ):
             out = []
@@ -958,6 +976,9 @@ class WanS2V:
                                     ) // 4 - lat_motion_frames
                 target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
                 frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
+                # Conditioning length depends on resolution; pre-allocate conservatively and
+                # allow dynamic growth in model forward.
+                self.cond_cache_init_len = max(1, int(frame_seq_length * self.num_frames_per_block))
                 clip_noise = [
                     torch.randn(
                         16,
@@ -976,7 +997,7 @@ class WanS2V:
                         self.vae.model.cpu()
                         self.text_encoder.model.cpu()
                         self.audio_encoder.model.cpu()
-                        torch.cuda.empty_cache()
+                        device_empty_cache(self.device.type)
                     self.kv_cache1 = {}
                     
                     if not self.offload_kv_cache:
@@ -1021,7 +1042,7 @@ class WanS2V:
                 if offload_model or self.init_on_cpu:
                     self.noise_model.to(self.device)
                     self.vae.model.cpu()
-                    torch.cuda.empty_cache()
+                    device_empty_cache(self.device.type)
 
                 #-----------------------------------------------Temporal denoising loop in single clip---------------------------------
                 # 2.2.0 prefill cond caching
@@ -1069,7 +1090,7 @@ class WanS2V:
                     timesteps = self._sampler_timesteps
                     sample_scheduler.timesteps = timesteps
                     sample_scheduler.sigmas = self._sampler_sigmas
-                    sample_scheduler._step_index = dist.get_rank() 
+                    sample_scheduler._step_index = dist.get_rank() if dist.is_initialized() else 0
                     sample_scheduler._begin_index = 0
 
                     block_latents = clip_latents[0][:, block_index *
@@ -1121,8 +1142,8 @@ class WanS2V:
                         print(f"offloading model to cpu, please wait...")
                         self.noise_model.cpu()
                         self.vae.model.to(self.device)
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
+                        device_synchronize(self.device.type)
+                        device_empty_cache(self.device.type)
                     ref_latents = clip_output.unsqueeze(0)[:, :, 0:1]
                     decode_latents = torch.cat(
                         [motion_latents, clip_output.unsqueeze(0)], dim=2
@@ -1149,8 +1170,8 @@ class WanS2V:
                     if offload_model:
                         self.vae.model.cpu()
                         self.noise_model.to(self.device)
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
+                        device_synchronize(self.device.type)
+                        device_empty_cache(self.device.type)
                 else:
                     clip_outputs.append(clip_output.detach().cpu())
 
@@ -1164,8 +1185,8 @@ class WanS2V:
                 self.kv_cache1 = None
                 # self.noise_model.cpu()
                 self.vae.model.to(self.device)
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                device_synchronize(self.device.type)
+                device_empty_cache(self.device.type)
 
             motion_latents_pp = motion_latents
             for clip_idx, clip_output_cpu in enumerate(clip_outputs):
@@ -1210,8 +1231,8 @@ class WanS2V:
             self.vae.model.cpu()
             self.noise_model.to(self.device)
             gc.collect()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            device_synchronize(self.device.type)
+            device_empty_cache(self.device.type)
 
         return videos[0] if self.rank == 0 else None, dataset_info
 

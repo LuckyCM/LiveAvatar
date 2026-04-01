@@ -317,9 +317,9 @@ def initialize_pipeline(args, training_settings):
         wan_s2v_pipeline = None
         # Force garbage collection
         gc.collect()
-        # Empty CUDA cache if available
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Best-effort device cache cleanup
+        prefer_backend = parse_device_backend_arg(args.device_backend) if getattr(args, "device_backend", None) else env_device_backend()
+        empty_cache(resolve_device_backend(prefer_backend))
     
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -330,6 +330,7 @@ def initialize_pipeline(args, training_settings):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     prefer_backend = parse_device_backend_arg(args.device_backend) if getattr(args, "device_backend", None) else env_device_backend()
     device_backend = resolve_device_backend(prefer_backend)
+    args.device_backend_resolved = device_backend
     device = local_rank if device_backend in ("cuda", "npu") else 0
     
     global_rank = rank
@@ -343,7 +344,8 @@ def initialize_pipeline(args, training_settings):
     
     set_device(local_rank, device_backend)
     
-    if not dist.is_initialized():
+    # Do not initialize distributed for single-process runs.
+    if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(
             backend=default_dist_backend(device_backend),
             init_method="env://",
@@ -624,11 +626,11 @@ def _run_inference_computation(prompt, image_path, audio_path, num_clip,
         
         # Clean up
         del video
-        torch.cuda.empty_cache()
+        empty_cache(getattr(global_args, "device_backend_resolved", "auto"))
         
         # Synchronize in distributed mode
         if dist.is_initialized():
-            torch.cuda.synchronize()
+            synchronize(getattr(global_args, "device_backend_resolved", "auto"))
             dist.barrier()
             # Broadcast video path to all ranks (for consistency)
             video_path_list = [video_path] if global_rank == global_save_rank else [None]

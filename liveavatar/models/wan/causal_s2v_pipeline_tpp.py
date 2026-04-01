@@ -44,6 +44,9 @@ from .wan_2_2.utils.fm_solvers import (
 from .wan_2_2.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ...utils.load_weight_utils import load_state_dict
 from liveavatar.utils.router.utils import process_masks_to_routing_logits
+from liveavatar.utils.device_backend import autocast as device_autocast
+from liveavatar.utils.device_backend import empty_cache as device_empty_cache
+from liveavatar.utils.device_backend import synchronize as device_synchronize
 from .inference_utils import STREAMING_VAE
 if STREAMING_VAE:
     from .wan_2_2.modules.vae_streaming import WanVAE as Wan2_1_VAE
@@ -626,8 +629,9 @@ class WanS2V:
             kv_cache1.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=device),
-                "cond_k": torch.zeros([batch_size, 3000, 40, 128], dtype=dtype, device=device), #hard-coded for 720*400 resolution
-                "cond_v": torch.zeros([batch_size, 3000, 40, 128], dtype=dtype, device=device), #hard-coded for 720*400 resolution
+                # Resolution-dependent; grow on demand in model forward.
+                "cond_k": torch.zeros([batch_size, int(getattr(self, "cond_cache_init_len", 1)), 40, 128], dtype=dtype, device=device),
+                "cond_v": torch.zeros([batch_size, int(getattr(self, "cond_cache_init_len", 1)), 40, 128], dtype=dtype, device=device),
                 "cond_end": torch.tensor([0], dtype=torch.long, device=device) #dynamically updated 2640
             })
 
@@ -760,8 +764,15 @@ class WanS2V:
         """
         # ------------------------------------Step 1: prepare conditional inputs--------------------------------------
         
+        size_arg = generate_size
+        if isinstance(size_arg, str) and "*" in size_arg:
+            try:
+                size_arg = tuple(int(x) for x in size_arg.split("*", 1))
+            except Exception:
+                size_arg = None
+
         size = self.get_gen_size(
-            size=None,
+            size=size_arg,
             max_area=max_area,
             ref_image_path=ref_image_path,
             pre_video_path=None)
@@ -943,7 +954,7 @@ class WanS2V:
 
         #--------------------------------------Step 2: generate--------------------------------------
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                device_autocast(self.device.type, dtype=self.param_dtype, enabled=(self.device.type != "cpu")),
                 torch.no_grad(),
         ):
             out = []
@@ -961,6 +972,9 @@ class WanS2V:
                                         ) // 4 - lat_motion_frames
                     target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
                     frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
+                    # Conditioning length depends on resolution; pre-allocate conservatively and
+                    # allow dynamic growth in model forward.
+                    self.cond_cache_init_len = max(1, int(frame_seq_length * self.num_frames_per_block))
                     clip_noise = [
                         torch.randn(
                             16,
@@ -1109,7 +1123,7 @@ class WanS2V:
                             vae_wait_start = time.time()
                             block_latents = torch.empty_like(block_latents)
                             dist.recv(block_latents, self.src_gpu)
-                            torch.cuda.synchronize()
+                            device_synchronize(self.device.type)
                             if time.time() - vae_wait_start < 0.01:
                                 print(f"WARNING: VAE serves as a bottleneck!")
 
@@ -1118,8 +1132,8 @@ class WanS2V:
                         if offload_model:
                             print(f"offloading model to cpu")
                             self.noise_model.cpu()
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                            device_synchronize(self.device.type)
+                            device_empty_cache(self.device.type)
                         if r == 0 and active_nr != 1:
                             if block_index == 0: #cache new ref
                                 ref_latents = block_latents.unsqueeze(0)[:,:,0:1] # 更新attention sink anchor到generated image，broadcast到所有rank
@@ -1153,7 +1167,7 @@ class WanS2V:
             # del sample_scheduler
             if offload_model:
                 gc.collect()
-                torch.cuda.synchronize()
+                device_synchronize(self.device.type)
 
             return videos[0], dataset_info
         else:

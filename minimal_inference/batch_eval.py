@@ -18,6 +18,17 @@ import torch.distributed as dist
 from PIL import Image
 import yaml
 
+from liveavatar.utils.device_backend import (
+    default_dist_backend,
+    empty_cache,
+    env_device_backend,
+    parse_device_backend_arg,
+    preferred_infer_dtype,
+    resolve_device_backend,
+    set_device,
+    synchronize,
+)
+
 # import liveavatar.models.wan.wan_2_2 as wan
 from liveavatar.models.wan.causal_s2v_pipeline_tpp import WanS2V
 from liveavatar.models.wan.wan_2_2.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
@@ -122,11 +133,23 @@ def _validate_args(args):
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
-    # Size check
-    if not 's2v' in args.task:
-        assert args.size in SUPPORTED_SIZES[
-            args.
-            task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+
+    # Size check (keep strict for non-s2v tasks, s2v supports custom H*W)
+    if 's2v' not in args.task:
+        assert args.size in SUPPORTED_SIZES[args.task], (
+            f"Unsupport size {args.size} for task {args.task}, supported sizes are: "
+            f"{', '.join(SUPPORTED_SIZES[args.task])}"
+        )
+
+
+def _parse_size_hw(size: str):
+    """Parse size string into (H, W). Accepts known presets or '<H>*<W>'."""
+    if size in SIZE_CONFIGS:
+        return SIZE_CONFIGS[size]
+    if isinstance(size, str) and '*' in size:
+        h, w = size.split('*', 1)
+        return int(h), int(w)
+    raise ValueError(f"Invalid --size: {size!r}. Expected one of presets or '<H>*<W>'.")
 
 
 def _parse_args():
@@ -140,10 +163,15 @@ def _parse_args():
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
     parser.add_argument(
+        "--device_backend",
+        type=str,
+        default=None,
+        choices=["auto", "cuda", "npu", "cpu"],
+        help="Runtime device backend. Default: env LIVEAVATAR_DEVICE_BACKEND or auto-detect.")
+    parser.add_argument(
         "--size",
         type=str,
         default="1280*720",
-        choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
     parser.add_argument(
@@ -409,6 +437,9 @@ def generate_single_sample(wan_s2v, args, cfg, sample_idx, sample_name, sample_d
     logging.info(f"  Audio: {sample_data['audio']}")
     logging.info(f"  Num_clip: {sample_data['num_clip']}")
     
+    h, w = _parse_size_hw(args.size)
+    max_area = MAX_AREA_CONFIGS.get(args.size, int(h) * int(w))
+
     video, dataset_info = wan_s2v.generate(
         input_prompt=sample_data['prompt'],
         ref_image_path=sample_data['image'],
@@ -419,8 +450,8 @@ def generate_single_sample(wan_s2v, args, cfg, sample_idx, sample_name, sample_d
         tts_text=args.tts_text,
         num_repeat=sample_data['num_clip'],
         pose_video=args.pose_video,
-        generate_size=args.size,
-        max_area=MAX_AREA_CONFIGS[args.size],
+        generate_size=(h, w),
+        max_area=max_area,
         infer_frames=args.infer_frames,
         shift=args.sample_shift,
         sample_solver=args.sample_solver,
@@ -500,10 +531,10 @@ def generate_single_sample(wan_s2v, args, cfg, sample_idx, sample_name, sample_d
                 merge_video_audio(video_path=save_file, audio_path="tts.wav")
     
     del video
-    torch.cuda.empty_cache()
+    empty_cache(getattr(args, "device_backend_resolved", "auto"))
     
     if dist.is_initialized():
-        torch.cuda.synchronize()
+        synchronize(getattr(args, "device_backend_resolved", "auto"))
         dist.barrier()
 
 
@@ -514,6 +545,15 @@ def generate(args, training_settings):
     if world_size == 1:
         rank = 0
     local_rank = int(os.getenv("LOCAL_RANK", 0))
+
+    prefer_backend = parse_device_backend_arg(args.device_backend) if args.device_backend else env_device_backend()
+    device_backend = resolve_device_backend(prefer_backend)
+    args.device_backend_resolved = device_backend
+
+    # Set device for this process (no-op on cpu)
+    if world_size == 1:
+        local_rank = 0
+    set_device(local_rank, device_backend)
     device = local_rank
     _init_logging(rank)
 
@@ -521,12 +561,12 @@ def generate(args, training_settings):
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        rank=rank,
-        world_size=world_size)
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend=default_dist_backend(device_backend),
+            init_method="env://",
+            rank=rank,
+            world_size=world_size)
     if world_size > 1:
         assert world_size >= 5, "At least 5 GPUs are supported for distributed inference."
         assert args.num_gpus_dit == 4, "Only 4 GPUs are supported for distributed inference."
@@ -615,6 +655,7 @@ def generate(args, training_settings):
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
+            device_type=device_backend,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,

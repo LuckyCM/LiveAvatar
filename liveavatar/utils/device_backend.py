@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from typing import Literal, Optional
 
 import torch
@@ -71,6 +72,68 @@ def synchronize(backend: DeviceBackend) -> None:
         torch.cuda.synchronize()
 
 
+def empty_cache(backend: DeviceBackend) -> None:
+    """Best-effort device cache cleanup (no-op if unsupported)."""
+    if backend == "npu" and hasattr(torch, "npu"):
+        try:
+            torch.npu.empty_cache()
+        except Exception:
+            return
+    if backend == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def is_backend_available(backend: DeviceBackend) -> bool:
+    if backend == "cpu":
+        return True
+    if backend == "cuda":
+        return torch.cuda.is_available()
+    if backend == "npu":
+        try:
+            return hasattr(torch, "npu") and torch.npu.is_available()
+        except Exception:
+            return False
+    return False
+
+
+def preferred_infer_dtype(backend: DeviceBackend) -> torch.dtype:
+    """Default inference dtype for the backend.
+
+    Ascend 910B prefers bfloat16.
+    """
+    if backend == "npu":
+        return torch.bfloat16
+    # keep conservative default for cuda/cpu unless caller overrides
+    return torch.float16 if backend == "cuda" else torch.float32
+
+
+def autocast_device_type_from_tensors(*tensors: object, fallback: DeviceBackend = "auto") -> str:
+    for t in tensors:
+        if isinstance(t, torch.Tensor):
+            return t.device.type
+    return resolve_device_backend(fallback)
+
+
+@contextmanager
+def autocast(
+    device_type: str,
+    dtype: torch.dtype = torch.bfloat16,
+    enabled: bool = True,
+):
+    """Device-agnostic autocast context.
+
+    Uses `torch.autocast` when available (PyTorch 2.6+), falls back to
+    `torch.amp.autocast`.
+    """
+    try:
+        with torch.autocast(device_type=device_type, dtype=dtype, enabled=enabled):
+            yield
+    except Exception:
+        # Older or vendor builds may not expose torch.autocast
+        with torch.amp.autocast(device_type, dtype=dtype, enabled=enabled):
+            yield
+
+
 def default_dist_backend(backend: DeviceBackend) -> str:
     if backend == "npu":
         return "hccl"
@@ -101,4 +164,3 @@ def env_device_backend(default: DeviceBackend = "auto") -> DeviceBackend:
         return parse_device_backend_arg(v)
     except Exception:
         return default
-
