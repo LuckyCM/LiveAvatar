@@ -100,6 +100,16 @@ def _validate_args(args):
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(0, sys.maxsize)
 
 
+def _parse_size_hw(size: str):
+    """Parse size string into (H, W). Accepts known presets or '<H>*<W>'."""
+    if size in SIZE_CONFIGS:
+        return SIZE_CONFIGS[size]
+    if isinstance(size, str) and "*" in size:
+        h, w = size.split("*", 1)
+        return int(h), int(w)
+    raise ValueError(f"Invalid size '{size}'. Expected preset or '<H>*<W>'")
+
+
 def _parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -122,7 +132,6 @@ def _parse_args():
         "--size",
         type=str,
         default=None,
-        choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video.")
     parser.add_argument(
         "--frame_num",
@@ -555,6 +564,9 @@ def _run_inference_computation(prompt, image_path, audio_path, num_clip,
         logging.info(f"  Seed: {base_seed}")
         logging.info(f"  Solver: {sample_solver}")
         
+        h, w = _parse_size_hw(size)
+        max_area = MAX_AREA_CONFIGS.get(size, int(h) * int(w))
+
         # Generate video
         video, dataset_info = wan_s2v_pipeline.generate(
             input_prompt=prompt,
@@ -567,7 +579,7 @@ def _run_inference_computation(prompt, image_path, audio_path, num_clip,
             num_repeat=num_clip,
             pose_video=global_args.pose_video,
             generate_size=size,
-            max_area=MAX_AREA_CONFIGS[size],
+            max_area=max_area,
             infer_frames=infer_frames,
             shift=global_args.sample_shift,
             sample_solver=sample_solver,

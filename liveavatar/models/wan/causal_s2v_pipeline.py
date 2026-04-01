@@ -139,6 +139,12 @@ class WanS2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device,dtype=self.param_dtype)
 
+        # Resolution / tokenization factors (used to make shape math dynamic).
+        # vae_stride: (t, h, w) in pixel space; patch_size: (t, h, w) in latent space.
+        self._vae_stride = tuple(getattr(config, "vae_stride", (4, 8, 8)))
+        self._patch_size = tuple(getattr(getattr(config, "transformer", None), "patch_size", (1, 2, 2)))
+        self._size_divisor = int(self._vae_stride[1] * self._patch_size[1])
+
         if self.is_training:
             from liveavatar.models.wan.flow_match import FlowMatchScheduler_Omni
             self.scheduler = FlowMatchScheduler_Omni(shift=5, sigma_min=0.0, extra_one_step=True)
@@ -368,7 +374,9 @@ class WanS2V:
                                 height,
                                 width,
                                 target_area=1024 * 704,
-                                divisor=64):
+                                divisor: int | None = None):
+        if divisor is None:
+            divisor = int(getattr(self, "_size_divisor", 64))
         if height * width <= target_area:
             # If the original image area is already less than or equal to the target,
             # no resizing is needed—just padding. Still need to ensure that the padded area doesn't exceed the target.
@@ -396,9 +404,9 @@ class WanS2V:
             scale = max_scale - (max_scale - min_scale) * i / 100
             new_height, new_width = int(height * scale), int(width * scale)
 
-            # Pad to make dimensions divisible by 64
-            pad_height = (64 - new_height % 64) % 64
-            pad_width = (64 - new_width % 64) % 64
+            # Pad to make dimensions divisible by `divisor`
+            pad_height = (divisor - new_height % divisor) % divisor
+            pad_width = (divisor - new_width % divisor) % divisor
             pad_top = pad_height // 2
             pad_bottom = pad_height - pad_top
             pad_left = pad_width // 2
@@ -612,15 +620,21 @@ class WanS2V:
             else:
                 ref_image = np.array(Image.open(ref_image_path).convert('RGB'))
             HEIGHT, WIDTH = ref_image.shape[:2]
-        HEIGHT, WIDTH = self.get_size_less_than_area(
-            HEIGHT, WIDTH, target_area=max_area)
+        if max_area is not None:
+            HEIGHT, WIDTH = self.get_size_less_than_area(
+                HEIGHT,
+                WIDTH,
+                target_area=max_area,
+            )
         return (HEIGHT, WIDTH)
 
-    def _initialize_kv_cache(self, batch_size, dtype, device, gpu_id, kv_cache_size=13500):
+    def _initialize_kv_cache(self, batch_size, dtype, device, gpu_id, kv_cache_size: int | None = None):
         """
         Initialize a Per-GPU KV cache for the Wan model.
         gpu_id : "1","2","3","4"
         """
+        if kv_cache_size is None:
+            raise ValueError("kv_cache_size must be provided (resolution-dependent)")
         device = ("cpu" if self.offload_kv_cache else self._device_str(0)) if self.single_gpu else device
         kv_cache1 = []
 
@@ -700,7 +714,7 @@ class WanS2V:
         num_repeat=1,
         pose_video=None,
         generate_size=None,
-        max_area=720 * 1280,
+        max_area: int | None = None,
         infer_frames=80,
         shift=5.0,
         sample_solver='unipc',
@@ -774,6 +788,11 @@ class WanS2V:
                 size_arg = tuple(int(x) for x in size_arg.split("*", 1))
             except Exception:
                 size_arg = None
+
+        # If max_area is not specified, default to "no downscale" (keep requested size
+        # or reference image size).
+        if max_area is None and size_arg is not None:
+            max_area = int(size_arg[0]) * int(size_arg[1])
 
         size = self.get_gen_size(
             size=size_arg,
@@ -870,13 +889,28 @@ class WanS2V:
             )
             print(f"Rank {rank}: Looking for masks in: {tracking_mask_results_dir}")
             
-            target_shape = (1, infer_frames // 4, HEIGHT // 8, WIDTH // 8)
+            vae_t, vae_h, vae_w = self._vae_stride
+            patch_t, patch_h, patch_w = self._patch_size
+            latent_h = HEIGHT // vae_h
+            latent_w = WIDTH // vae_w
+            if latent_h % patch_h != 0 or latent_w % patch_w != 0:
+                raise ValueError(
+                    f"Invalid spatial size {HEIGHT}*{WIDTH}: "
+                    f"latent {latent_h}*{latent_w} not divisible by patch {patch_h}*{patch_w}."
+                )
+            target_shape = (1, infer_frames // vae_t, latent_h, latent_w)
             routing_logits = process_masks_to_routing_logits(
                 tracking_mask_results_dir,
                 shape=target_shape
             )
             num_actors = routing_logits.shape[-1]
-            routing_logits = routing_logits.reshape(1, infer_frames // 4, HEIGHT // 8 // 2, WIDTH // 8 // 2, num_actors)
+            routing_logits = routing_logits.reshape(
+                1,
+                infer_frames // vae_t,
+                latent_h // patch_h,
+                latent_w // patch_w,
+                num_actors,
+            )
             routing_logits = routing_logits.to(device=self.device, dtype=self.param_dtype)
             mask = routing_logits.permute(4,1,2,3,0)  # [num_actors, t, h, w, 1]
 
@@ -922,7 +956,9 @@ class WanS2V:
         if num_repeat is None or num_repeat > nr:
             num_repeat = nr
 
-        lat_motion_frames = (self.motion_frames + 3) // 4
+        vae_t, vae_h, vae_w = self._vae_stride
+        patch_t, patch_h, patch_w = self._patch_size
+        lat_motion_frames = (self.motion_frames + (vae_t - 1)) // vae_t
         model_pic = crop_opreat(resize_opreat(Image.fromarray(ref_image)))
 
         ref_pixel_values = tensor_trans(model_pic)
@@ -983,10 +1019,19 @@ class WanS2V:
                 seed_g = torch.Generator(device=self.device)
                 seed_g.manual_seed(seed + r)
 
-                lat_target_frames = (infer_frames + 3 + self.motion_frames
-                                    ) // 4 - lat_motion_frames
-                target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
-                frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
+                lat_target_frames = (
+                    (infer_frames + (vae_t - 1) + self.motion_frames) // vae_t
+                    - lat_motion_frames
+                )
+                latent_h = HEIGHT // vae_h
+                latent_w = WIDTH // vae_w
+                if latent_h % patch_h != 0 or latent_w % patch_w != 0:
+                    raise ValueError(
+                        f"Invalid spatial size {HEIGHT}*{WIDTH}: "
+                        f"latent {latent_h}*{latent_w} not divisible by patch {patch_h}*{patch_w}."
+                    )
+                target_shape = [lat_target_frames, latent_h, latent_w]
+                frame_seq_length = (latent_h // patch_h) * (latent_w // patch_w)
                 # Conditioning length depends on resolution; pre-allocate conservatively and
                 # allow dynamic growth in model forward.
                 self.cond_cache_init_len = max(1, int(frame_seq_length * self.num_frames_per_block))
@@ -1001,7 +1046,7 @@ class WanS2V:
                         generator=seed_g)
                 ]
                 clip_output = torch.zeros_like(clip_noise[0]) #[16,f,h,w]
-                max_seq_len = np.prod(target_shape) // 4
+                max_seq_len = int(np.prod(target_shape) // (patch_h * patch_w))
                 if self.kv_cache1 is None:
                     if offload_model or self.init_on_cpu:
                         self.noise_model.to(self.device)
@@ -1066,8 +1111,9 @@ class WanS2V:
                         block_index = 0
                         block_latents = clip_latents[0][:, block_index *
                                         self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
-                        left_idx = block_index * (self.num_frames_per_block * 4)
-                        right_idx = (block_index+1) * (self.num_frames_per_block * 4)
+                        block_frames = self.num_frames_per_block * vae_t
+                        left_idx = block_index * block_frames
+                        right_idx = (block_index + 1) * block_frames
                         block_arg_c = {
                             'context': context[0:1], #list(1) torch.Size([19, 4096])
                             'seq_len': None,
@@ -1108,8 +1154,9 @@ class WanS2V:
 
                     block_latents = clip_latents[0][:, block_index *
                                 self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
-                    left_idx = block_index * (self.num_frames_per_block * 4)
-                    right_idx = (block_index+1) * (self.num_frames_per_block * 4)
+                    block_frames = self.num_frames_per_block * vae_t
+                    left_idx = block_index * block_frames
+                    right_idx = (block_index + 1) * block_frames
                     block_arg_c = {
                         'context': context[0:1], #list(1) torch.Size([19, 4096])
                         'seq_len': None,

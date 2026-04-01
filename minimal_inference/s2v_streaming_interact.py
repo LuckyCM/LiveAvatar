@@ -115,6 +115,16 @@ def _validate_args(args):
             task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
 
+def _parse_size_hw(size: str):
+    """Parse size string into (H, W). Accepts known presets or '<H>*<W>'."""
+    if size in SIZE_CONFIGS:
+        return SIZE_CONFIGS[size]
+    if isinstance(size, str) and "*" in size:
+        h, w = size.split("*", 1)
+        return int(h), int(w)
+    raise ValueError(f"Invalid --size '{size}'. Expected preset or '<H>*<W>'")
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
@@ -136,7 +146,6 @@ def _parse_args():
         "--size",
         type=str,
         default="1280*720",
-        choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
     parser.add_argument(
@@ -560,6 +569,9 @@ def generate(args, training_settings):
         # Prepare video path for SAM2 processing (will be handled in pipeline)
         logging.info(f"Generating video ...")
 
+        h, w = _parse_size_hw(args.size)
+        max_area = MAX_AREA_CONFIGS.get(args.size, int(h) * int(w))
+
         video,dataset_info = wan_s2v.generate(
             input_prompt=args.prompt,
             ref_image_path=args.image,
@@ -571,7 +583,7 @@ def generate(args, training_settings):
             num_repeat=args.num_clip,
             pose_video=args.pose_video,
             generate_size=args.size,
-            max_area=MAX_AREA_CONFIGS[args.size],
+            max_area=max_area,
             infer_frames=args.infer_frames,
             shift=args.sample_shift,
             sample_solver=args.sample_solver,

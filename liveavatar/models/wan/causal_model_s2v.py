@@ -265,7 +265,21 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         super().__init__(dim, num_heads, window_size, qk_norm, eps)
         self.local_attn_size = local_attn_size
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, block_mask, kv_cache=None, current_start=0, current_end=0, sp_size=None,seg_idx=None,freqs_cond=None):
+    def forward(
+        self,
+        x,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        block_mask,
+        kv_cache=None,
+        current_start=0,
+        current_end=0,
+        sp_size=None,
+        seg_idx=None,
+        freqs_cond=None,
+        frame_seqlen: int | None = None,
+    ):
         """
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -318,7 +332,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                     q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
                 roped_key = causal_rope_apply(
                     k, grid_sizes, freqs).type_as(v)
-                seg_len_block = seg_idx[1]-seg_idx[0]
+                seg_len_block = seg_idx[1] - seg_idx[0]
                 active_kv_cache_start = 0
                 if current_start >= kv_cache['k'].shape[1]:# for case current_start > kv_cache size, kv_rolling
                     assert self.local_attn_size == -1, "local_attn_size should be -1 for streaming inference"
@@ -329,8 +343,16 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 else:
                     active_kv_cache_size = current_start+seg_len_block
                     if self.local_attn_size != -1:
-                        # hard-code for case num_frames_per_block=3
-                        active_kv_cache_start = max(0,active_kv_cache_size - self.local_attn_size * seg_len_block // 3)
+                        # local_attn_size is measured in frames; convert to tokens by `frame_seqlen`.
+                        _frame_seqlen = int(frame_seqlen) if frame_seqlen is not None else 0
+                        if _frame_seqlen <= 0:
+                            raise ValueError(
+                                f"Invalid {frame_seqlen=}; expected positive int for streaming KV windowing."
+                            )
+                        active_kv_cache_start = max(
+                            0,
+                            active_kv_cache_size - self.local_attn_size * _frame_seqlen,
+                        )
                     active_cond_cache_size = int(kv_cache["cond_end"])
 
                 kv_cache["k"][:, current_start:(current_start+seg_len_block)] = roped_key[:,seg_idx[0]:seg_idx[1]]
@@ -452,7 +474,20 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         norm_x = self.norm1(x).float() # [b,l,dim] e和e0都是 float，纠缠时需要变 float
         norm_x = norm_x*(1+e[1])+e[0] # [b,l,dim]
         
-        y = self.self_attn(norm_x.type_as(bf_dtype_tensor), seq_lens, grid_sizes, freqs, block_mask, kv_cache, current_start, current_end, sp_size,seg_idx,freqs_cond) # [b,l,dim]
+        y = self.self_attn(
+            norm_x.type_as(bf_dtype_tensor),
+            seq_lens,
+            grid_sizes,
+            freqs,
+            block_mask,
+            kv_cache,
+            current_start,
+            current_end,
+            sp_size,
+            seg_idx,
+            freqs_cond,
+            frame_seqlen=frame_seqlen,
+        )  # [b,l,dim]
 
         with amp.autocast(dtype=torch.float32):
             y = y * e[2]
@@ -843,9 +878,11 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
-        device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1,
-        motion_and_ref_seqlen: int = 0
+        device: torch.device | str,
+        num_frames: int,
+        frame_seqlen: int,
+        num_frame_per_block: int = 1,
+        motion_and_ref_seqlen: int = 0,
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -881,23 +918,10 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
                                        KV_LEN=total_length + padded_length, _compile=False, device=device)
-        
-        
-        num_frames = 21
-        frame_seqlen = 384
-        motion_and_ref_seqlen = 960
-        heads = 4
-        # block_mask = prepare_blockwise_causal_attn_mask(device="cuda", num_frames=num_frames, frame_seqlen=frame_seqlen, num_frame_per_block=1, motion_and_ref_seqlen=motion_and_ref_seqlen)
-        seq_len = math.ceil((num_frames*frame_seqlen+motion_and_ref_seqlen)/128)*128
-        q = torch.randn(2, heads,seq_len, 128).to("cuda")
-        k = q.clone()
-        v = q.clone()
 
         import torch.distributed as dist
         if not dist.is_initialized() or dist.get_rank() == 0:
-            print(
-                f" cache a block wise causal mask with block size of {num_frame_per_block} frames")
-            print(block_mask)
+            print(f"cache block-wise causal mask ({num_frame_per_block=} frames)")
 
         return block_mask
 

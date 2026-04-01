@@ -115,6 +115,11 @@ class WanS2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
+        # Resolution / tokenization factors (used to make shape math dynamic).
+        self._vae_stride = tuple(getattr(config, "vae_stride", (4, 8, 8)))
+        self._patch_size = tuple(getattr(getattr(config, "transformer", None), "patch_size", (1, 2, 2)))
+        self._size_divisor = int(self._vae_stride[1] * self._patch_size[1])
+
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         if not dit_fsdp:
             self.noise_model = WanModel_S2V.from_pretrained(
@@ -194,7 +199,9 @@ class WanS2V:
                                 height,
                                 width,
                                 target_area=1024 * 704,
-                                divisor=64):
+                                divisor: int | None = None):
+        if divisor is None:
+            divisor = int(getattr(self, "_size_divisor", 64))
         if height * width <= target_area:
             # If the original image area is already less than or equal to the target,
             # no resizing is needed—just padding. Still need to ensure that the padded area doesn't exceed the target.
@@ -222,9 +229,9 @@ class WanS2V:
             scale = max_scale - (max_scale - min_scale) * i / 100
             new_height, new_width = int(height * scale), int(width * scale)
 
-            # Pad to make dimensions divisible by 64
-            pad_height = (64 - new_height % 64) % 64
-            pad_width = (64 - new_width % 64) % 64
+            # Pad to make dimensions divisible by `divisor`
+            pad_height = (divisor - new_height % divisor) % divisor
+            pad_width = (divisor - new_width % divisor) % divisor
             pad_top = pad_height // 2
             pad_bottom = pad_height - pad_top
             pad_left = pad_width // 2
@@ -389,8 +396,12 @@ class WanS2V:
             else:
                 ref_image = np.array(Image.open(ref_image_path).convert('RGB'))
             HEIGHT, WIDTH = ref_image.shape[:2]
-        HEIGHT, WIDTH = self.get_size_less_than_area(
-            HEIGHT, WIDTH, target_area=max_area)
+        if max_area is not None:
+            HEIGHT, WIDTH = self.get_size_less_than_area(
+                HEIGHT,
+                WIDTH,
+                target_area=max_area,
+            )
         return (HEIGHT, WIDTH)
 
     def generate(
@@ -404,7 +415,7 @@ class WanS2V:
         tts_text,
         num_repeat=1,
         pose_video=None,
-        max_area=720 * 1280,
+        max_area: int | None = None,
         infer_frames=80,
         shift=5.0,
         sample_solver='unipc',
@@ -492,7 +503,9 @@ class WanS2V:
         if num_repeat is None or num_repeat > nr:
             num_repeat = nr
 
-        lat_motion_frames = (self.motion_frames + 3) // 4
+        vae_t, vae_h, vae_w = self._vae_stride
+        patch_t, patch_h, patch_w = self._patch_size
+        lat_motion_frames = (self.motion_frames + (vae_t - 1)) // vae_t
         model_pic = crop_opreat(resize_opreat(Image.fromarray(ref_image)))
 
         ref_pixel_values = tensor_trans(model_pic)
@@ -545,9 +558,18 @@ class WanS2V:
                 seed_g = torch.Generator(device=self.device)
                 seed_g.manual_seed(seed + r)
 
-                lat_target_frames = (infer_frames + 3 + self.motion_frames
-                                    ) // 4 - lat_motion_frames
-                target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
+                lat_target_frames = (
+                    (infer_frames + (vae_t - 1) + self.motion_frames) // vae_t
+                    - lat_motion_frames
+                )
+                latent_h = HEIGHT // vae_h
+                latent_w = WIDTH // vae_w
+                if latent_h % patch_h != 0 or latent_w % patch_w != 0:
+                    raise ValueError(
+                        f"Invalid spatial size {HEIGHT}*{WIDTH}: "
+                        f"latent {latent_h}*{latent_w} not divisible by patch {patch_h}*{patch_w}."
+                    )
+                target_shape = [lat_target_frames, latent_h, latent_w]
                 noise = [
                     torch.randn(
                         16,
@@ -558,7 +580,7 @@ class WanS2V:
                         device=self.device,
                         generator=seed_g)
                 ]
-                max_seq_len = np.prod(target_shape) // 4
+                max_seq_len = int(np.prod(target_shape) // (patch_h * patch_w))
 
                 if sample_solver == 'unipc':
                     sample_scheduler = FlowUniPCMultistepScheduler(
