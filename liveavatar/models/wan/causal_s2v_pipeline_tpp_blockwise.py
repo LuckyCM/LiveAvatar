@@ -14,7 +14,10 @@ import time
 import subprocess
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+try:
+    import torch.npu.amp as amp  # type: ignore
+except Exception:  # pragma: no cover
+    import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from decord import VideoReader
@@ -64,6 +67,7 @@ class WanS2V:
         config,
         checkpoint_dir,
         device_id=0,
+        device_type="cuda",
         rank=0,
         t5_fsdp=False,
         dit_fsdp=False,
@@ -103,7 +107,11 @@ class WanS2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device_type = str(device_type)
+        if self.device_type == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(f"{self.device_type}:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -191,6 +199,11 @@ class WanS2V:
         self.fps = config.sample_fps
         self.audio_sample_m = 0
         self.tgt_gpu_id = 0
+
+    def _device_str(self, idx: int) -> str:
+        if self.device.type == "cpu":
+            return "cpu"
+        return f"{self.device.type}:{idx}"
     
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming", pretrained_lora_path=None, state_dict_converter=None, load_only=False, load_lora_weight_only=False):
         if not load_only:
@@ -653,10 +666,10 @@ class WanS2V:
         Move the KV cache to the working GPU.
         move_id : "1","2","3","4"
         """
-        if gpu_id == 0: #move to working device
-            tgt_device =f"cuda:{gpu_id}"
-        else: #offload
-            tgt_device = "cpu" if self.single_gpu else f"cuda:{gpu_id}"
+        if gpu_id == 0:  # move to working device
+            tgt_device = self._device_str(gpu_id)
+        else:  # offload
+            tgt_device = "cpu" if self.single_gpu else self._device_str(gpu_id)
             
         kv_cache1 = self.kv_cache1[str(moved_id)]
         for layer in kv_cache1:
@@ -828,7 +841,7 @@ class WanS2V:
                             self._initialize_kv_cache(
                                     batch_size=1,
                                     dtype=self.param_dtype,
-                                    device=f"cuda:{local_rank}",
+                                    device=self._device_str(local_rank),
                                     kv_cache_size=max_seq_len
                                 )
 

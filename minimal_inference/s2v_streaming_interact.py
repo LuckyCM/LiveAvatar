@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
+import copy
 import logging
 import os
 import sys
@@ -23,6 +24,14 @@ from liveavatar.models.wan.wan_2_2.utils.prompt_extend import DashScopePromptExp
 from liveavatar.models.wan.wan_2_2.utils.utils import merge_video_audio, save_video, str2bool
 from liveavatar.utils.args_config import parse_args_for_training_config as training_config_parser
 from liveavatar.utils.router.synthesize_audio import merge_multiple_audio_files
+from liveavatar.utils.device_backend import (
+    default_dist_backend,
+    env_device_backend,
+    parse_device_backend_arg,
+    resolve_device_backend,
+    set_device,
+    synchronize,
+)
 
 EXAMPLE_PROMPT = {
     "s2v-14B": {
@@ -62,6 +71,11 @@ def _validate_args(args):
     if args.task == "i2v-A14B":
         assert args.image is not None, "Please specify the image path for i2v."
 
+    # Align with external entry flags
+    if getattr(args, "single_first", False):
+        # external flag name; in this repo we use start_from_ref
+        args.start_from_ref = True
+
     cfg = WAN_CONFIGS[args.task]
 
     if args.sample_steps is None:
@@ -95,6 +109,13 @@ def _parse_args():
         default="t2v-A14B",
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
+
+    parser.add_argument(
+        "--device_backend",
+        type=str,
+        default=None,
+        choices=["auto", "cuda", "npu", "cpu"],
+        help="Runtime device backend. Default: env LIVEAVATAR_DEVICE_BACKEND or auto-detect.")
     parser.add_argument(
         "--size",
         type=str,
@@ -190,7 +211,7 @@ def _parse_args():
         "--sample_solver",
         type=str,
         default='euler',
-        choices=['euler', 'unipc', 'dpm++'],
+        choices=['euler', 'unipc', 'dpm++', 'fewstep_fm'],
         help="The solver used to sample.")
     parser.add_argument(
         "--sample_steps", type=int, default=None, help="The sampling steps.")
@@ -253,6 +274,12 @@ def _parse_args():
         default=False,
         help="whether set the reference image as the starting point for generation"
     )
+
+    # Keep external CLI compatibility (placeholders for now)
+    parser.add_argument("--rm_first_frames", type=int, default=0, help="[compat] reserved")
+    parser.add_argument("--pseudo_last_frames", type=int, default=0, help="[compat] reserved")
+    parser.add_argument("--dummy_frames", type=int, default=0, help="[compat] reserved")
+    parser.add_argument("--single_first", action="store_true", default=False, help="[compat] alias of --start_from_ref")
     parser.add_argument(
         "--infer_frames",
         type=int,
@@ -355,16 +382,19 @@ def generate(args, training_settings):
     if world_size == 1:
         rank = 0
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
+    # Device/backend
+    prefer_backend = parse_device_backend_arg(args.device_backend) if getattr(args, "device_backend", None) else env_device_backend()
+    device_backend = resolve_device_backend(prefer_backend)
+    device = local_rank if device_backend in ("cuda", "npu") else 0
     _init_logging(rank)
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
-    torch.cuda.set_device(local_rank)
+    set_device(local_rank, device_backend)
     dist.init_process_group(
-        backend="nccl",
+        backend=default_dist_backend(device_backend),
         init_method="env://",
         rank=rank,
         world_size=world_size)
@@ -409,6 +439,16 @@ def generate(args, training_settings):
                 f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
 
     cfg = WAN_CONFIGS[args.task]
+
+    # Map external solver name to internal scheduler selection
+    if args.sample_solver == "fewstep_fm":
+        # Repo currently supports FlowMatchEuler/UniPC/DPM++; fewstep_fm is treated as Euler FM.
+        cfg = copy.deepcopy(cfg)
+        cfg.sample_solver = "euler"
+        logging.info("sample_solver=fewstep_fm mapped to cfg.sample_solver=euler")
+    elif hasattr(cfg, "sample_solver") and args.sample_solver != cfg.sample_solver:
+        cfg = copy.deepcopy(cfg)
+        cfg.sample_solver = args.sample_solver
     if args.ulysses_size > 1:
         assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
 
@@ -456,6 +496,7 @@ def generate(args, training_settings):
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
+            device_type=device_backend,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -558,14 +599,15 @@ def generate(args, training_settings):
             suffix = '.mp4'
             # args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
             args.save_file = f"{formatted_time}_{args.sample_steps}step_{formatted_prompt}"
-            # Only add lora suffix for .pt files (local paths with sufficient depth)
-            path_parts = args.lora_path_dmd.split("/")
-            if args.lora_path_dmd.endswith(".pt") and len(path_parts) >= 3:
-                lora_suffix = path_parts[-3] + "_" + path_parts[-1].split(".")[0]
-                args.save_file = args.save_file + "_" + lora_suffix
-                if args.save_dir is None:
-                    args.save_dir = "./output/" + lora_suffix + "/"
-            elif args.save_dir is None:
+            # Only add lora suffix when lora_path_dmd is provided
+            if args.lora_path_dmd is not None:
+                path_parts = args.lora_path_dmd.split("/")
+                if args.lora_path_dmd.endswith(".pt") and len(path_parts) >= 3:
+                    lora_suffix = path_parts[-3] + "_" + path_parts[-1].split(".")[0]
+                    args.save_file = args.save_file + "_" + lora_suffix
+                    if args.save_dir is None:
+                        args.save_dir = "./output/" + lora_suffix + "/"
+            if args.save_dir is None:
                 args.save_dir = "./output/"
             os.makedirs(args.save_dir, exist_ok=True)
             args.save_file = args.save_dir + args.save_file + suffix
@@ -584,7 +626,7 @@ def generate(args, training_settings):
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
 
-    torch.cuda.synchronize()
+    synchronize(device_backend)
     if dist.is_initialized():
         print(f"rank {rank} done, waiting for other ranks to finish...")
         # dist.barrier()
@@ -594,7 +636,11 @@ def generate(args, training_settings):
     logging.info("Finished.")
 
 
-if __name__ == "__main__":
+def main():
     args = _parse_args()
     training_settings = training_config_parser(args.training_config)
     generate(args, training_settings)
+
+
+if __name__ == "__main__":
+    main()

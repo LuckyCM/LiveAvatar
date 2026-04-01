@@ -13,7 +13,16 @@ def init_distributed_group():
     """r initialize sequence parallel group.
     """
     if not dist.is_initialized():
-        dist.init_process_group(backend='nccl')
+        backend = 'gloo'
+        if hasattr(torch, 'npu'):
+            try:
+                if torch.npu.is_available():
+                    backend = 'hccl'
+            except Exception:
+                pass
+        if backend == 'gloo' and torch.cuda.is_available():
+            backend = 'nccl'
+        dist.init_process_group(backend=backend)
 
 
 def get_or_create_sp_group(sp_size=None):

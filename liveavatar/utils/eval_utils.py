@@ -167,7 +167,16 @@ def evaluate_video_metrics(pred_video_path, gt_video_path, fps=30):
     # 计算 FVD (这里假设有实际的 FVD 计算函数)
     gen_tensor = torch.from_numpy(np.array(gen_frames)).permute(0, 3, 1, 2)[None, :] / 255.
     real_tensor = torch.from_numpy(np.array(real_frames)).permute(0, 3, 1, 2)[None, :] / 255.
-    fvd_value = calculate_fvd(gen_tensor, real_tensor, device='cuda:0' if torch.cuda.is_available() else 'cpu')
+    if hasattr(torch, "npu"):
+        try:
+            if torch.npu.is_available():
+                fvd_value = calculate_fvd(gen_tensor, real_tensor, device='npu:0')
+            else:
+                fvd_value = calculate_fvd(gen_tensor, real_tensor, device='cuda:0' if torch.cuda.is_available() else 'cpu')
+        except Exception:
+            fvd_value = calculate_fvd(gen_tensor, real_tensor, device='cuda:0' if torch.cuda.is_available() else 'cpu')
+    else:
+        fvd_value = calculate_fvd(gen_tensor, real_tensor, device='cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # 汇总结果
     metrics = {

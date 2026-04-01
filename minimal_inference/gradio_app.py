@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
+import copy
 import logging
 import os
 import sys
@@ -21,6 +22,13 @@ from liveavatar.models.wan.wan_2_2.distributed.util import init_distributed_grou
 from liveavatar.models.wan.wan_2_2.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from liveavatar.models.wan.wan_2_2.utils.utils import merge_video_audio, save_video, str2bool
 from liveavatar.utils.args_config import parse_args_for_training_config as training_config_parser
+from liveavatar.utils.device_backend import (
+    default_dist_backend,
+    env_device_backend,
+    parse_device_backend_arg,
+    resolve_device_backend,
+    set_device,
+)
 
 # Global variables for pipeline and config
 wan_s2v_pipeline = None
@@ -103,6 +111,13 @@ def _parse_args():
         default="s2v-14B",
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
+
+    parser.add_argument(
+        "--device_backend",
+        type=str,
+        default=None,
+        choices=["auto", "cuda", "npu", "cpu"],
+        help="Runtime device backend. Default: env LIVEAVATAR_DEVICE_BACKEND or auto-detect.")
     parser.add_argument(
         "--size",
         type=str,
@@ -153,7 +168,7 @@ def _parse_args():
         "--sample_solver",
         type=str,
         default='euler',
-        choices=['euler', 'unipc', 'dpm++'],
+        choices=['euler', 'unipc', 'dpm++', 'fewstep_fm'],
         help="The solver used to sample.")
     parser.add_argument(
         "--sample_steps", 
@@ -302,8 +317,9 @@ def initialize_pipeline(args, training_settings):
         wan_s2v_pipeline = None
         # Force garbage collection
         gc.collect()
-        # Empty CUDA cache
-        torch.cuda.empty_cache()
+        # Empty CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -312,7 +328,9 @@ def initialize_pipeline(args, training_settings):
         rank = 0
     
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
+    prefer_backend = parse_device_backend_arg(args.device_backend) if getattr(args, "device_backend", None) else env_device_backend()
+    device_backend = resolve_device_backend(prefer_backend)
+    device = local_rank if device_backend in ("cuda", "npu") else 0
     
     global_rank = rank
     global_world_size = world_size
@@ -323,11 +341,11 @@ def initialize_pipeline(args, training_settings):
         args.offload_model = False if world_size > 1 else True
         logging.info(f"offload_model is not specified, set to {args.offload_model}.")
     
-    torch.cuda.set_device(local_rank)
+    set_device(local_rank, device_backend)
     
     if not dist.is_initialized():
         dist.init_process_group(
-            backend="nccl",
+            backend=default_dist_backend(device_backend),
             init_method="env://",
             rank=rank,
             world_size=world_size)
@@ -355,6 +373,13 @@ def initialize_pipeline(args, training_settings):
         init_distributed_group()
     
     cfg = WAN_CONFIGS[args.task]
+    if args.sample_solver == "fewstep_fm":
+        cfg = copy.deepcopy(cfg)
+        cfg.sample_solver = "euler"
+        logging.info("sample_solver=fewstep_fm mapped to cfg.sample_solver=euler")
+    elif hasattr(cfg, "sample_solver") and args.sample_solver != cfg.sample_solver:
+        cfg = copy.deepcopy(cfg)
+        cfg.sample_solver = args.sample_solver
     
     logging.info(f"Pipeline initialization args: {args}")
     logging.info(f"Model config: {cfg}")
@@ -372,6 +397,7 @@ def initialize_pipeline(args, training_settings):
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
+            device_type=device_backend,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
@@ -935,4 +961,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -38,6 +38,7 @@ class WanTI2V:
         config,
         checkpoint_dir,
         device_id=0,
+        device_type="cuda",
         rank=0,
         t5_fsdp=False,
         dit_fsdp=False,
@@ -72,7 +73,10 @@ class WanTI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        if str(device_type) == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(f"{device_type}:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu

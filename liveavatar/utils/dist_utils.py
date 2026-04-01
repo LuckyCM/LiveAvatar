@@ -10,7 +10,19 @@ def initialize_distributed(args):
     if args.device == "cpu":
         pass
     else:
-        torch.cuda.set_device(args.device)
+        if isinstance(args.device, str) and args.device.startswith("npu"):
+            import torch_npu  # noqa: F401
+            idx = int(args.device.split(":")[-1]) if ":" in args.device else 0
+            torch.npu.set_device(idx)
+        elif isinstance(args.device, str) and args.device.startswith("cuda"):
+            idx = int(args.device.split(":")[-1]) if ":" in args.device else 0
+            torch.cuda.set_device(idx)
+        else:
+            # fallback: try cuda
+            try:
+                torch.cuda.set_device(args.device)
+            except Exception:
+                pass
     # Call the init process
     init_method = "tcp://"
     args.master_ip = os.getenv("MASTER_ADDR", "localhost")
@@ -26,8 +38,13 @@ def initialize_distributed(args):
     print(f'| rank {args.rank} distribution init at {init_method}')
 
     init_method = "env://" #暂时这样使用
+    backend = 'nccl'
+    if isinstance(args.device, str) and args.device.startswith('npu'):
+        backend = 'hccl'
+    elif args.device == 'cpu':
+        backend = 'gloo'
     torch.distributed.init_process_group(
-        backend='nccl', world_size=args.world_size, rank=args.rank, init_method=init_method
+        backend=backend, world_size=args.world_size, rank=args.rank, init_method=init_method
     )
     return True
 

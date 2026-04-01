@@ -81,7 +81,13 @@ def parse_args():
     args.rank = int(os.getenv("RANK", "0"))
     args.world_size = int(os.getenv("WORLD_SIZE", "1"))
     args.local_rank = int(os.getenv("LOCAL_RANK", "0"))  # torchrun
-    args.device = f'cuda:{args.local_rank}'
+    backend = os.getenv("LIVEAVATAR_DEVICE_BACKEND", "cuda").strip().lower()
+    if backend == "npu":
+        args.device = f"npu:{args.local_rank}"
+    elif backend == "cpu":
+        args.device = "cpu"
+    else:
+        args.device = f"cuda:{args.local_rank}"
     args.num_nodes = int(os.getenv("NNODES", "1"))
     debug = args.debug
     if not os.path.exists(args.exp_path):
