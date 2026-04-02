@@ -695,9 +695,9 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         d = self._rope_head_dim
         freqs = torch.cat(
             [
-                rope_params(max_len, d - 4 * (d // 6), device=device),
-                rope_params(max_len, 2 * (d // 6), device=device),
-                rope_params(max_len, 2 * (d // 6), device=device),
+                rope_params(max_len, d - 4 * (d // 6)).to(device=device),
+                rope_params(max_len, 2 * (d // 6)).to(device=device),
+                rope_params(max_len, 2 * (d // 6)).to(device=device),
             ],
             dim=1,
         )
