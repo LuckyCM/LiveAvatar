@@ -212,11 +212,51 @@ class WanS2V:
         self.drop_first_motion = config.drop_first_motion
         self.fps = config.sample_fps
         self.audio_sample_m = 0
+        # TorchAir torch.compile (NPU) is enabled lazily on first forward.
+        self._npu_torch_compile_done = False
 
     def _device_str(self, idx: int) -> str:
         if self.device.type == "cpu":
             return "cpu"
         return f"{self.device.type}:{idx}"
+
+    def _maybe_enable_npu_torch_compile(self):
+        """Enable torch.compile with TorchAir backend (NPU) to dump captured graphs.
+
+        NOTE: We compile lazily to ensure the model has been moved to NPU already.
+        """
+        if getattr(self, "_npu_torch_compile_done", False):
+            return
+        # Only enable on NPU runtime.
+        if str(getattr(self, "device_type", "")) != "npu" and getattr(self.device, "type", "") != "npu":
+            return
+        if not hasattr(torch, "compile"):
+            print("[TorchAir] torch.compile 不可用，跳过 NPU torch.compile 注入")
+            self._npu_torch_compile_done = True
+            return
+        try:
+            import torchair  # type: ignore
+        except Exception as e:
+            print(f"[TorchAir] torchair import 失败，跳过 NPU torch.compile 注入: {e}")
+            self._npu_torch_compile_done = True
+            return
+
+        try:
+            config = torchair.CompilerConfig()
+            config.debug.graph_dump.type = "pbtxt"
+            npu_backend = torchair.get_compiler(config=config)
+
+            print("==== 强行开启 NPU Torch.Compile ====")
+            self.noise_model = torch.compile(
+                self.noise_model,
+                backend=npu_backend,
+                dynamic=True,
+            )
+        except Exception as e:
+            # Keep original behavior if compilation fails.
+            print(f"[TorchAir] NPU torch.compile 注入失败，回退为未编译模型: {e}")
+        finally:
+            self._npu_torch_compile_done = True
     
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming", pretrained_lora_path=None, state_dict_converter=None, load_only=False, load_lora_weight_only=False):
         if not load_only:
@@ -1064,6 +1104,8 @@ class WanS2V:
                 if self.kv_cache1 is None:
                     if offload_model or self.init_on_cpu:
                         self.noise_model.to(self.device)
+                        # Enable TorchAir torch.compile after the model is on NPU.
+                        self._maybe_enable_npu_torch_compile()
                         self.vae.model.cpu()
                         self.text_encoder.model.cpu()
                         self.audio_encoder.model.cpu()
@@ -1113,6 +1155,8 @@ class WanS2V:
 
                 if offload_model or self.init_on_cpu:
                     self.noise_model.to(self.device)
+                    # In case the model was offloaded/reloaded, ensure compile is enabled once.
+                    self._maybe_enable_npu_torch_compile()
                     self.vae.model.cpu()
                     device_empty_cache(self.device.type)
 
