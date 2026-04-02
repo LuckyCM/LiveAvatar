@@ -3,14 +3,15 @@
 export ASCEND_RT_VISIBLE_DEVICES=0
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 # LiveAvatar 的原生编译和 FP8 是给 NVIDIA Triton 写的，在 NPU 上必须关掉
-export ENABLE_COMPILE=False
+export ENABLE_COMPILE=true
 export ENABLE_FP8=False 
-export LIVEAVATAR_DISABLE_NPU_FUSED_ATTN=false
+export LIVEAVATAR_DISABLE_NPU_FUSED_ATTN=true
 
 FFMPEG_DIR=$(python3 -c "import os, imageio_ffmpeg; print(os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()))")
 export PATH="${FFMPEG_DIR}:${PATH}"
 
 # 2. LiveAvatar 兼容的启动命令
+PYTHONUNBUFFERED=1 TORCHDYNAMO_VERBOSE=1 TORCH_LOGS="recompiles,recompiles_verbose,guards,graph_breaks,dynamic,aot_graphs" TORCHAIR_LOG_LEVEL=DEBUG 
 torchrun --nproc_per_node=1 --master_port=29101 minimal_inference/s2v_streaming_interact.py \
     --task s2v-1.3B \
     --ckpt_dir ./speed_test_1_3B_0327/FidoAvatar_1.3B_0327 \
