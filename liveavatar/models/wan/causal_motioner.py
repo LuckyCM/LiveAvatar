@@ -17,12 +17,11 @@ from liveavatar.models.wan.causal_s2v_utils import rollout_grid_sizes
 @amp.autocast(enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len, dtype=torch.float32),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
-    return freqs
+    # Return purely-real RoPE params (cos, sin) to avoid complex64 issues on NPU.
+    positions = torch.arange(max_seq_len, dtype=torch.float32)
+    inv_freq = 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim))
+    angles = torch.outer(positions, inv_freq)
+    return torch.cos(angles), torch.sin(angles)
 
 
 class FramePackMotioner(nn.Module):
@@ -55,12 +54,13 @@ class FramePackMotioner(nn.Module):
         assert (inner_dim %
                 num_heads) == 0 and (inner_dim // num_heads) % 2 == 0
         d = inner_dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+        cos0, sin0 = rope_params(1024, d - 4 * (d // 6))
+        cos1, sin1 = rope_params(1024, 2 * (d // 6))
+        cos2, sin2 = rope_params(1024, 2 * (d // 6))
+        self.freqs = (
+            torch.cat([cos0, cos1, cos2], dim=1),
+            torch.cat([sin0, sin1, sin2], dim=1),
+        )
         self.drop_mode = drop_mode
         self.slide_motion_frames = slide_motion_frames
 
