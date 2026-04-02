@@ -1271,6 +1271,14 @@ class WanS2V:
                 decode_latents = torch.cat(
                     [motion_latents_pp, clip_output.unsqueeze(0)], dim=2
                 )
+                # #region debug-point E:vae-input
+                if clip_idx == 0:
+                    import json, urllib.request
+                    _p = '.dbg/pixelated-output.env'
+                    _u, _s = 'http://127.0.0.1:7777/event', 'pixelated-output'
+                    exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass")
+                    urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId": _s, "runId": "pre", "hypothesisId": "E", "location": "causal_s2v_pipeline.py:1274", "msg": "[DEBUG] vae decode input stats", "data": {"clip_idx": int(clip_idx), "decode_latents_dtype": str(decode_latents.dtype), "decode_latents_shape": list(decode_latents.shape), "decode_latents_mean": float(decode_latents.float().mean().item()), "decode_latents_std": float(decode_latents.float().std().item()), "decode_latents_min": float(decode_latents.float().min().item()), "decode_latents_max": float(decode_latents.float().max().item())}}).encode(), headers={"Content-Type": "application/json"})).read()
+                # #endregion
 
                 image = torch.stack(self.vae.decode(decode_latents))
                 image = image[:, :, -(infer_frames):]

@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
 import torch
 import math
 
@@ -27,6 +28,42 @@ __all__ = [
     'flash_attention',
     'attention',
 ]
+
+
+def _use_npu_fused_attention():
+    return FLASH_ATTN_2_NPU_AVAILABLE and os.getenv(
+        "LIVEAVATAR_DISABLE_NPU_FUSED_ATTN", "false"
+    ).lower() not in ("1", "true", "yes", "on")
+
+
+def _sdpa_attention(q, k, v, q_lens, k_lens, dropout_p, softmax_scale, causal, window_size, dtype):
+    if window_size != (-1, -1):
+        warnings.warn(
+            'Windowed attention is disabled when using scaled_dot_product_attention fallback on NPU.'
+        )
+    attn_mask = None
+    if q_lens is not None or k_lens is not None:
+        if q_lens is None:
+            q_lens = torch.full((q.size(0),), q.size(1), dtype=torch.int32, device=q.device)
+        if k_lens is None:
+            k_lens = torch.full((k.size(0),), k.size(1), dtype=torch.int32, device=k.device)
+        attn_mask = make_attn_mask_from_lens(
+            q_lens, k_lens, q.size(1), k.size(1), dtype=q.dtype, device=q.device
+        ).bool()
+
+    q = q.transpose(1, 2).to(dtype)
+    k = k.transpose(1, 2).to(dtype)
+    v = v.transpose(1, 2).to(dtype)
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=causal,
+        scale=softmax_scale,
+    )
+    return out.transpose(1, 2).contiguous()
 
 
 def make_attn_mask_from_lens(q_lens: torch.Tensor,
@@ -91,7 +128,7 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
 
-    if q.device.type == 'npu' and FLASH_ATTN_2_NPU_AVAILABLE:
+    if q.device.type == 'npu' and _use_npu_fused_attention():
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -135,6 +172,19 @@ def flash_attention(
 
         x = x_bnsd.transpose(1, 2).contiguous()
         return x.type(out_dtype)
+    elif q.device.type == 'npu':
+        return _sdpa_attention(
+            q=q,
+            k=k,
+            v=v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            dtype=dtype,
+        ).type(out_dtype)
 
     # preprocess query
     if q_lens is None:
@@ -217,7 +267,7 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if q.device.type == 'npu' and FLASH_ATTN_2_NPU_AVAILABLE:
+    if q.device.type == 'npu':
         return flash_attention(
             q=q,
             k=k,

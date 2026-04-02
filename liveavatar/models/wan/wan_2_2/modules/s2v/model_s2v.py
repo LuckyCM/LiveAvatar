@@ -64,15 +64,22 @@ def torch_dfs(model: nn.Module, parent_name='root'):
 @conditional_compile
 def rope_apply(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
+    freqs_real = freqs.real.to(torch.float32)
+    freqs_imag = freqs.imag.to(torch.float32)
     # loop over samples
     output = []
     for i, _ in enumerate(x):
         s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(
-            s, n, -1, 2))
-        freqs_i = freqs[i, :s]
+        x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
+        freqs_i_real = freqs_real[i, :s]
+        freqs_i_imag = freqs_imag[i, :s]
         # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x0 = x_i[..., 0]
+        x1 = x_i[..., 1]
+        rotated = torch.empty_like(x_i)
+        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
+        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
+        x_i = rotated.flatten(2)
         x_i = torch.cat([x_i, x[i, s:]])
         # append to collection
         output.append(x_i)
@@ -82,15 +89,22 @@ def rope_apply(x, grid_sizes, freqs, start=None):
 @conditional_compile
 def rope_apply_cond(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
+    freqs_real = freqs.real.to(torch.float32)
+    freqs_imag = freqs.imag.to(torch.float32)
     # loop over samples
     output = []
     for i, _ in enumerate(x):
         s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(
-            s, n, -1, 2))
-        freqs_i = freqs[i, :s]
+        x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
+        freqs_i_real = freqs_real[i, :s]
+        freqs_i_imag = freqs_imag[i, :s]
         # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x0 = x_i[..., 0]
+        x1 = x_i[..., 1]
+        rotated = torch.empty_like(x_i)
+        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
+        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
+        x_i = rotated.flatten(2)
         x_i = torch.cat([x_i, x[i, s:]])
         # append to collection
         output.append(x_i)
@@ -99,16 +113,22 @@ def rope_apply_cond(x, grid_sizes, freqs, start=None):
 @amp.autocast(enabled=False)
 def rope_apply_usp(x, grid_sizes, freqs):
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    freqs_real = freqs.real.to(torch.float32)
+    freqs_imag = freqs.imag.to(torch.float32)
     # loop over samples
     output = []
     for i, _ in enumerate(x):
         s = x.size(1)
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2))
-        freqs_i = freqs[i]
-        freqs_i_rank = freqs_i
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+        x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
+        freqs_i_real = freqs_real[i]
+        freqs_i_imag = freqs_imag[i]
+        x0 = x_i[..., 0]
+        x1 = x_i[..., 1]
+        rotated = torch.empty_like(x_i)
+        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
+        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
+        x_i = rotated.flatten(2)
         x_i = torch.cat([x_i, x[i, s:]])
         # append to collection
         output.append(x_i)

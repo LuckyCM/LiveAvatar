@@ -5,6 +5,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 # LiveAvatar 的原生编译和 FP8 是给 NVIDIA Triton 写的，在 NPU 上必须关掉
 export ENABLE_COMPILE=False
 export ENABLE_FP8=False 
+export LIVEAVATAR_DISABLE_NPU_FUSED_ATTN=false
 
 FFMPEG_DIR=$(python3 -c "import os, imageio_ffmpeg; print(os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()))")
 export PATH="${FFMPEG_DIR}:${PATH}"

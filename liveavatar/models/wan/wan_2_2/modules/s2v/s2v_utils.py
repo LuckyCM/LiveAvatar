@@ -87,7 +87,17 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
                 # 4. 完美的 Float32 赋值 (绕过 NPU 无法 InplaceCopy 复数的 Bug)
                 output_float[i, seq_bucket[-1]:seq_bucket[-1] + seq_len] = freqs_stacked
         seq_bucket.append(seq_bucket[-1] + seq_len)
-        
+
+    # #region debug-point B:rope-precompute
+    if not getattr(rope_precompute, "_dbg_logged", False):
+        rope_precompute._dbg_logged = True
+        import json, urllib.request
+        _p = '.dbg/pixelated-output.env'
+        _u, _s = 'http://127.0.0.1:7777/event', 'pixelated-output'
+        exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass")
+        urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId": _s, "runId": "pre", "hypothesisId": "B", "location": "s2v_utils.py:91", "msg": "[DEBUG] rope_precompute output stats", "data": {"x_dtype": str(x.dtype), "freqs_dtype": str(freqs.dtype), "output_shape": list(output_float.shape), "output_real_mean": float(output_float[..., 0].float().mean().item()), "output_real_std": float(output_float[..., 0].float().std().item()), "output_imag_mean": float(output_float[..., 1].float().mean().item()), "output_imag_std": float(output_float[..., 1].float().std().item()), "frame_freq_mean": float(f_r.float().mean().item()), "frame_freq_std": float(f_r.float().std().item()), "frame_freq_imag_mean": float(f_i.float().mean().item()), "frame_freq_imag_std": float(f_i.float().std().item())}}).encode(), headers={"Content-Type": "application/json"})).read()
+    # #endregion
+
     # 5. 最后一秒钟，转回復数格式返回
     return torch.view_as_complex(output_float)
 

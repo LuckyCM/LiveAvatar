@@ -40,24 +40,36 @@ def rope_apply(x, grid_sizes, freqs):
 
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freqs_real = tuple(f.real.to(torch.float32) for f in freqs)
+    freqs_imag = tuple(f.imag.to(torch.float32) for f in freqs)
 
     # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        # precompute multipliers (pure real expansion without complex dtype)
+        x_i = x[i, :seq_len].to(torch.float32).reshape(seq_len, n, -1, 2)
+        freqs_i_real = torch.cat([
+            freqs_real[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_real[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_real[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-                            dim=-1).reshape(seq_len, 1, -1)
+                                 dim=-1).reshape(seq_len, 1, -1)
+        freqs_i_imag = torch.cat([
+            freqs_imag[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_imag[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_imag[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+                                 dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        # apply rotary embedding via real-imag expansion
+        x0 = x_i[..., 0]
+        x1 = x_i[..., 1]
+        rotated = torch.empty_like(x_i)
+        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
+        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
+        x_i = rotated.flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection

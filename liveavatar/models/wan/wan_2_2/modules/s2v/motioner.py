@@ -102,10 +102,16 @@ def rope_apply(x, grid_sizes, freqs, start=None):
                     freqs_i = trainable_freqs.unsqueeze(1)
                 # apply rotary embedding
                 # precompute multipliers
-                x_i = torch.view_as_complex(
-                    x[i, seq_bucket[-1]:seq_bucket[-1] + seq_len].to(
-                        torch.float32).reshape(seq_len, n, -1, 2))
-                x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+                x_i = x[i, seq_bucket[-1]:seq_bucket[-1] + seq_len].to(
+                    torch.float32).reshape(seq_len, n, -1, 2)
+                freqs_i_real = freqs_i.real.to(torch.float32)
+                freqs_i_imag = freqs_i.imag.to(torch.float32)
+                x0 = x_i[..., 0]
+                x1 = x_i[..., 1]
+                rotated = torch.empty_like(x_i)
+                rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
+                rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
+                x_i = rotated.flatten(2)
                 output[i, seq_bucket[-1]:seq_bucket[-1] + seq_len] = x_i
         seq_bucket.append(seq_bucket[-1] + seq_len)
     return output.float()

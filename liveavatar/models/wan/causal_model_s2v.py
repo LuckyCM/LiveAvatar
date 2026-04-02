@@ -331,6 +331,15 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                     q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
                 roped_key = causal_rope_apply(
                     k, grid_sizes, freqs).type_as(v)
+                # #region debug-point D:qk-before-attn
+                if not getattr(self, "_dbg_attn_logged", False):
+                    self._dbg_attn_logged = True
+                    import json, urllib.request
+                    _p = '.dbg/pixelated-output.env'
+                    _u, _s = 'http://127.0.0.1:7777/event', 'pixelated-output'
+                    exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass")
+                    urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId": _s, "runId": "pre", "hypothesisId": "D", "location": "causal_model_s2v.py:334", "msg": "[DEBUG] self attention qk stats before flash attention", "data": {"q_dtype": str(q.dtype), "k_dtype": str(k.dtype), "freqs_dtype": str(freqs.dtype), "q_mean": float(q.float().mean().item()), "q_std": float(q.float().std().item()), "k_mean": float(k.float().mean().item()), "k_std": float(k.float().std().item()), "roped_q_mean": float(roped_query.float().mean().item()), "roped_q_std": float(roped_query.float().std().item()), "roped_k_mean": float(roped_key.float().mean().item()), "roped_k_std": float(roped_key.float().std().item()), "current_start": int(current_start), "seg_idx": [int(seg_idx[0]), int(seg_idx[1]), int(seg_idx[2])]}}).encode(), headers={"Content-Type": "application/json"})).read()
+                # #endregion
                 seg_len_block = seg_idx[1] - seg_idx[0]
                 active_kv_cache_start = 0
                 kv_len = int(kv_cache["k"].shape[1])
