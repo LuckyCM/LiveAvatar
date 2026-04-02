@@ -105,8 +105,8 @@ def sp_attn_forward_s2v(self,
             v = self.v(x).view(b, s, n, d)
             return q, k, v
         q, k, v = qkv_fn(x)
-        roped_query = rope_apply_usp(q, grid_sizes, freqs).type_as(v)
-        roped_key = rope_apply_usp(k, grid_sizes, freqs).type_as(v)
+        roped_query = rope_apply_usp(q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
+        roped_key = rope_apply_usp(k, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
 
         # sp compute
         
@@ -297,8 +297,8 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         
         if kv_cache is None:
             assert False, "not implemented for self-forcing"
-            roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-            roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+            roped_query = rope_apply(q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
+            roped_key = rope_apply(k, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
 
             padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
             padded_roped_query = torch.cat(
@@ -328,9 +328,9 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         else:
             if seg_idx[1]-seg_idx[0] > 0: #streaming inference
                 roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
+                    q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v) #grid_sizes不参与计算
                 roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs).type_as(v)
+                    k, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
                 seg_len_block = seg_idx[1] - seg_idx[0]
                 active_kv_cache_start = 0
                 kv_len = int(kv_cache["k"].shape[1])
@@ -363,7 +363,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                                 [
                                 kv_cache["k"][:, active_kv_cache_start:active_kv_cache_size],
                                 causal_rope_apply_cond(
-                                    kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
+                                    kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond[..., 0], freqs_cond[..., 1]
                                     ).type_as(v)
                                 ],dim=1
                                 ),
@@ -382,7 +382,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                     )
             elif seg_idx[2]-seg_idx[1] > 0: #prefill cond caching
                 roped_query = causal_rope_apply_cond(
-                    q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
+                    q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v) #grid_sizes不参与计算
                 required_cond_len = int(seg_idx[2] - seg_idx[1])
                 kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), required_cond_len)
                 _ensure_kv_cache_len(kv_cache, "cond_k", int(kv_cache["cond_end"]))
@@ -392,7 +392,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 x = flash_attention(
                     q=roped_query[:,seg_idx[1]:seg_idx[2]],
                     k=causal_rope_apply_cond(
-                            k, grid_sizes, freqs
+                            k, grid_sizes, freqs[..., 0], freqs[..., 1]
                         ).type_as(v)[:,:int(kv_cache["cond_end"])],
                     v=kv_cache["cond_v"][:, :int(kv_cache["cond_end"])],
                     k_lens=torch.tensor(int(kv_cache["cond_end"]), device=q.device, dtype=torch.int32).repeat(b),
