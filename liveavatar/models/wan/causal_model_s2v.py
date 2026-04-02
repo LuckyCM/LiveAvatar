@@ -684,23 +684,27 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 max_idx = max(max_idx, int(g.abs().max().item()))
         return max_idx
 
-    def _get_rope_freqs(self, grid_sizes, device: torch.device) -> torch.Tensor:
+    def _get_rope_freqs(self, grid_sizes, device: torch.device):
         max_idx = self._rope_max_index_from_grid_sizes(grid_sizes)
         max_len = max(1, int(max_idx) + 1)
         key = (device.type, device.index, max_len)
         cached = self._rope_freqs_cache.get(key, None)
-        if isinstance(cached, torch.Tensor):
-            return cached
+        if (
+            isinstance(cached, (tuple, list))
+            and len(cached) == 2
+            and isinstance(cached[0], torch.Tensor)
+            and isinstance(cached[1], torch.Tensor)
+        ):
+            return cached[0], cached[1]
 
         d = self._rope_head_dim
-        freqs = torch.cat(
-            [
-                rope_params(max_len, d - 4 * (d // 6)).to(device=device),
-                rope_params(max_len, 2 * (d // 6)).to(device=device),
-                rope_params(max_len, 2 * (d // 6)).to(device=device),
-            ],
-            dim=1,
-        )
+        cos0, sin0 = rope_params(max_len, d - 4 * (d // 6))
+        cos1, sin1 = rope_params(max_len, 2 * (d // 6))
+        cos2, sin2 = rope_params(max_len, 2 * (d // 6))
+
+        cos = torch.cat([cos0, cos1, cos2], dim=1).to(device=device)
+        sin = torch.cat([sin0, sin1, sin2], dim=1).to(device=device)
+        freqs = (cos, sin)
         self._rope_freqs_cache[key] = freqs
         return freqs
 
@@ -1488,8 +1492,10 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         x = torch.cat(x) # torch.Size([bs, 8064, 1536])
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
+        freqs = self._get_rope_freqs(grid_sizes, x.device)
+        self.freqs = freqs
         self.pre_compute_freqs = rope_precompute(
-            x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None )  #TODO: start_frame = current_start // hw
+            x.detach().view(b, s, n, d), grid_sizes, freqs, start=None )  #TODO: start_frame = current_start // hw
 
         x = [u.unsqueeze(0) for u in x]
         self.pre_compute_freqs = [
