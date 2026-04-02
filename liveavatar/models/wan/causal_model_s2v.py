@@ -360,16 +360,24 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
         compiled_qkv = getattr(self, "_compiled_qkv", None)
         if compiled_qkv is not None and not torch.is_grad_enabled():
             q, k, v = compiled_qkv(x)
         else:
             q, k, v = self._qkv(x)
-        
+
+        # `model_s2v.rope_apply/rope_apply_cond` expects explicit (cos, sin).
+        cos, sin = freqs[..., 0], freqs[..., 1]
+        if freqs_cond is not None:
+            cos_cond, sin_cond = freqs_cond[..., 0], freqs_cond[..., 1]
+        else:
+            cos_cond, sin_cond = (None, None)
+
         if kv_cache is None:
             assert False, "not implemented for self-forcing"
-            roped_query = rope_apply(q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
-            roped_key = rope_apply(k, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
+            roped_query = rope_apply(q, grid_sizes, cos, sin).type_as(v)
+            roped_key = rope_apply(k, grid_sizes, cos, sin).type_as(v)
 
             padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
             padded_roped_query = torch.cat(
@@ -399,9 +407,9 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         else:
             if seg_idx[1]-seg_idx[0] > 0: #streaming inference
                 roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v) #grid_sizes不参与计算
+                    q, grid_sizes, cos, sin).type_as(v) #grid_sizes不参与计算
                 roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
+                    k, grid_sizes, cos, sin).type_as(v)
                 seg_len_block = seg_idx[1] - seg_idx[0]
                 active_kv_cache_start = 0
                 kv_len = int(kv_cache["k"].shape[1])
@@ -453,7 +461,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                     )
             elif seg_idx[2]-seg_idx[1] > 0: #prefill cond caching
                 roped_query = causal_rope_apply_cond(
-                    q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v) #grid_sizes不参与计算
+                    q, grid_sizes, cos, sin).type_as(v) #grid_sizes不参与计算
                 required_cond_len = int(seg_idx[2] - seg_idx[1])
                 cond_cap = int(kv_cache["cond_k"].shape[1])
                 if required_cond_len > cond_cap:
@@ -472,8 +480,9 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 if freqs_cond is None:
                     raise RuntimeError("freqs_cond is required for static packed cond KV.")
                 freqs_cond = _align_rope_freqs(freqs_cond, required_cond_len)
+                cos_cond, sin_cond = freqs_cond[..., 0], freqs_cond[..., 1]
                 cond_k_roped = causal_rope_apply_cond(
-                    cond_k_raw, None, freqs_cond[..., 0], freqs_cond[..., 1]
+                    cond_k_raw, None, cos_cond, sin_cond
                 ).type_as(v)
                 k_packed[:, :required_cond_len] = cond_k_roped
                 v_packed[:, :required_cond_len] = cond_v_raw
