@@ -7,24 +7,27 @@ from ....inference_utils import conditional_compile
 def rope_precompute(x, grid_sizes, freqs, start=None):
     b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
 
-    # 1. 第一时间将输入的复数频率拆解为纯实数 (Float32)
+    # RoPE cache is purely real: [..., 2] = (cos, sin). Never use complex64.
     if type(freqs) is list:
-        trainable_freqs = freqs[1]
-        freqs = freqs[0]
-        tf_r = trainable_freqs.real.to(torch.float32)
-        tf_i = trainable_freqs.imag.to(torch.float32)
+        # [ (base_cos, base_sin), (trainable_cos, trainable_sin) ]
+        (base_cos, base_sin) = freqs[0]
+        (tf_cos, tf_sin) = freqs[1]
+        tf_cos = tf_cos.to(dtype=torch.float32, device=x.device)
+        tf_sin = tf_sin.to(dtype=torch.float32, device=x.device)
     else:
-        tf_r, tf_i = None, None
+        (base_cos, base_sin) = freqs
+        tf_cos, tf_sin = None, None
 
-    f_r = freqs.real.to(torch.float32)
-    f_i = freqs.imag.to(torch.float32)
+    base_cos = base_cos.to(dtype=torch.float32, device=x.device)
+    base_sin = base_sin.to(dtype=torch.float32, device=x.device)
 
     split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
-    f_r_split = f_r.split(split_sizes, dim=1)
-    f_i_split = f_i.split(split_sizes, dim=1)
+    cos_split = base_cos.split(split_sizes, dim=1)
+    sin_split = base_sin.split(split_sizes, dim=1)
 
-    # 2. 将输入张量转为纯 Float32 格式，尾部维度为 2 (实部, 虚部)
-    output_float = x.detach().contiguous().to(torch.float32).reshape(b, s, n, -1, 2)
+    # Initialize cache to identity rotation (cos=1, sin=0) to avoid dirty data.
+    output_float = torch.zeros((b, s, n, c, 2), dtype=torch.float32, device=x.device)
+    output_float[..., 0] = 1.0
 
     seq_bucket = [0]
     if not type(grid_sizes) is list:
@@ -53,43 +56,43 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
                     w_sam = np.linspace(w_o.item(), (t_w + w_o).item() - 1, seq_w).astype(int).tolist()
 
                     # 3. 完美的 Float32 切片 (NPU 毫无压力)
-                    f0_r = f_r_split[0][f_sam]
-                    f0_i = f_i_split[0][f_sam]
+                    f0_cos = cos_split[0][f_sam]
+                    f0_sin = sin_split[0][f_sam]
                     if f_o < 0:
-                        f0_i = -f0_i  # 等同于复数的 conj()
+                        f0_sin = -f0_sin  # 等同于复数的 conj()
 
-                    f1_r = f_r_split[1][h_sam]
-                    f1_i = f_i_split[1][h_sam]
+                    f1_cos = cos_split[1][h_sam]
+                    f1_sin = sin_split[1][h_sam]
                     
-                    f2_r = f_r_split[2][w_sam]
-                    f2_i = f_i_split[2][w_sam]
+                    f2_cos = cos_split[2][w_sam]
+                    f2_sin = sin_split[2][w_sam]
 
                     # 展开维度
-                    f0_r = f0_r.view(seq_f, 1, 1, -1).expand(seq_f, seq_h, seq_w, -1)
-                    f0_i = f0_i.view(seq_f, 1, 1, -1).expand(seq_f, seq_h, seq_w, -1)
+                    f0_cos = f0_cos.view(seq_f, 1, 1, -1).expand(seq_f, seq_h, seq_w, -1)
+                    f0_sin = f0_sin.view(seq_f, 1, 1, -1).expand(seq_f, seq_h, seq_w, -1)
                     
-                    f1_r = f1_r.view(1, seq_h, 1, -1).expand(seq_f, seq_h, seq_w, -1)
-                    f1_i = f1_i.view(1, seq_h, 1, -1).expand(seq_f, seq_h, seq_w, -1)
+                    f1_cos = f1_cos.view(1, seq_h, 1, -1).expand(seq_f, seq_h, seq_w, -1)
+                    f1_sin = f1_sin.view(1, seq_h, 1, -1).expand(seq_f, seq_h, seq_w, -1)
                     
-                    f2_r = f2_r.view(1, 1, seq_w, -1).expand(seq_f, seq_h, seq_w, -1)
-                    f2_i = f2_i.view(1, 1, seq_w, -1).expand(seq_f, seq_h, seq_w, -1)
+                    f2_cos = f2_cos.view(1, 1, seq_w, -1).expand(seq_f, seq_h, seq_w, -1)
+                    f2_sin = f2_sin.view(1, 1, seq_w, -1).expand(seq_f, seq_h, seq_w, -1)
 
-                    # 分别合并实部和虚部
-                    cat_r = torch.cat([f0_r, f1_r, f2_r], dim=-1).reshape(seq_len, 1, -1)
-                    cat_i = torch.cat([f0_i, f1_i, f2_i], dim=-1).reshape(seq_len, 1, -1)
+                    # 分别合并 cos 和 sin
+                    cat_cos = torch.cat([f0_cos, f1_cos, f2_cos], dim=-1).reshape(seq_len, 1, -1)
+                    cat_sin = torch.cat([f0_sin, f1_sin, f2_sin], dim=-1).reshape(seq_len, 1, -1)
                     
                     # 组合成 [..., 2]
-                    freqs_stacked = torch.stack([cat_r, cat_i], dim=-1)
+                    freqs_stacked = torch.stack([cat_cos, cat_sin], dim=-1)
 
                 elif t_f < 0:
-                    freqs_stacked = torch.stack([tf_r, tf_i], dim=-1).unsqueeze(1)
+                    freqs_stacked = torch.stack([tf_cos, tf_sin], dim=-1).unsqueeze(1)
                 
                 # 4. 完美的 Float32 赋值 (绕过 NPU 无法 InplaceCopy 复数的 Bug)
                 output_float[i, seq_bucket[-1]:seq_bucket[-1] + seq_len] = freqs_stacked
         seq_bucket.append(seq_bucket[-1] + seq_len)
         
-    # 5. 最后一秒钟，转回復数格式返回
-    return torch.view_as_complex(output_float)
+    # 5. 直接返回纯实数 cache: [..., 2] = (cos, sin)
+    return output_float
 
 
 if __name__ == "__main__":
@@ -102,21 +105,20 @@ if __name__ == "__main__":
     start = None
     d = 128
     from liveavatar.models.wan.wan_2_2.modules.model import rope_params
-    freqs = torch.cat([
-            rope_params(16384, d - 4 * (d // 6)),
-            rope_params(16384, 2 * (d // 6)),
-            rope_params(16384, 2 * (d // 6))
-        ],
-                               dim=1).to('cuda')
+    cos0, sin0 = rope_params(16384, d - 4 * (d // 6))
+    cos1, sin1 = rope_params(16384, 2 * (d // 6))
+    cos2, sin2 = rope_params(16384, 2 * (d // 6))
+    freqs = (torch.cat([cos0, cos1, cos2], dim=1).to('cuda'),
+             torch.cat([sin0, sin1, sin2], dim=1).to('cuda'))
     torch.cuda.synchronize()
     import time;t_start = time.time()
-    output = rope_precompute(x.to('cuda'), grid_sizes, freqs.to('cuda'), start)
+    output = rope_precompute(x.to('cuda'), grid_sizes, freqs, start)
     torch.cuda.synchronize()
     print(f"rope precompute time: {time.time() - t_start}")
     x = torch.randn(1, 3375, 40,128).to('cuda')
     torch.cuda.synchronize()
     import time;t_start = time.time()
-    output = rope_precompute(x.to('cuda'), grid_sizes, freqs.to('cuda'), start)
+    output = rope_precompute(x.to('cuda'), grid_sizes, freqs, start)
     torch.cuda.synchronize()
     print(f"rope precompute time 2: {time.time() - t_start}")
     

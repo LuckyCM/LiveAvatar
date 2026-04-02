@@ -62,77 +62,62 @@ def torch_dfs(model: nn.Module, parent_name='root'):
 
 @amp.autocast(enabled=False)
 @conditional_compile
-def rope_apply(x, grid_sizes, freqs, start=None):
-    n, c = x.size(2), x.size(3) // 2
-    freqs_real = freqs.real.to(torch.float32)
-    freqs_imag = freqs.imag.to(torch.float32)
-    # loop over samples
+def rope_apply(x, grid_sizes, cos, sin, start=None):
+    """Apply RoPE using pure real cos/sin.
+
+    - Prefer `torch_npu.npu_rotary_mul` on NPU.
+    - Fallback to real math expansion on other backends.
+
+    Args:
+        x: [B, S, N, D]
+        cos/sin: [B, S, N, D/2] (or broadcastable)
+    """
+    n = x.size(2)
+
+    use_npu_op = (x.device.type == 'npu')
+    npu_rotary_mul = None
+    if use_npu_op:
+        try:
+            import torch_npu  # type: ignore
+
+            npu_rotary_mul = torch_npu.npu_rotary_mul
+        except Exception:
+            use_npu_op = False
+
+    half_dtypes = (torch.float16, torch.bfloat16)
+    op_dtype = x.dtype if x.dtype in half_dtypes else torch.float32
+
     output = []
     for i, _ in enumerate(x):
         s = x.size(1)
-        x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
-        freqs_i_real = freqs_real[i, :s]
-        freqs_i_imag = freqs_imag[i, :s]
-        # apply rotary embedding
-        x0 = x_i[..., 0]
-        x1 = x_i[..., 1]
-        rotated = torch.empty_like(x_i)
-        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
-        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
-        x_i = rotated.flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        # append to collection
-        output.append(x_i)
+        x_i = x[i, :s].to(op_dtype)
+        cos_i = cos[i, :s].to(dtype=op_dtype, device=x_i.device)
+        sin_i = sin[i, :s].to(dtype=op_dtype, device=x_i.device)
+
+        if use_npu_op and npu_rotary_mul is not None:
+            x_rot = npu_rotary_mul(x_i, cos_i, sin_i)
+        else:
+            x_ri = x_i.to(torch.float32).reshape(s, n, -1, 2)
+            x0 = x_ri[..., 0]
+            x1 = x_ri[..., 1]
+            rotated0 = x0 * cos_i - x1 * sin_i
+            rotated1 = x0 * sin_i + x1 * cos_i
+            x_rot = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
+
+        x_out = torch.cat([x_rot, x[i, s:]], dim=0)
+        output.append(x_out)
     return torch.stack(output).float()
 
 @amp.autocast(enabled=False)
 @conditional_compile
-def rope_apply_cond(x, grid_sizes, freqs, start=None):
-    n, c = x.size(2), x.size(3) // 2
-    freqs_real = freqs.real.to(torch.float32)
-    freqs_imag = freqs.imag.to(torch.float32)
-    # loop over samples
-    output = []
-    for i, _ in enumerate(x):
-        s = x.size(1)
-        x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
-        freqs_i_real = freqs_real[i, :s]
-        freqs_i_imag = freqs_imag[i, :s]
-        # apply rotary embedding
-        x0 = x_i[..., 0]
-        x1 = x_i[..., 1]
-        rotated = torch.empty_like(x_i)
-        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
-        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
-        x_i = rotated.flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+def rope_apply_cond(x, grid_sizes, cos, sin, start=None):
+    # Kept for compatibility with existing call sites.
+    return rope_apply(x, grid_sizes, cos, sin, start=start)
     
 @amp.autocast(enabled=False)
-def rope_apply_usp(x, grid_sizes, freqs):
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    freqs_real = freqs.real.to(torch.float32)
-    freqs_imag = freqs.imag.to(torch.float32)
-    # loop over samples
-    output = []
-    for i, _ in enumerate(x):
-        s = x.size(1)
-        # precompute multipliers
-        x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
-        freqs_i_real = freqs_real[i]
-        freqs_i_imag = freqs_imag[i]
-        x0 = x_i[..., 0]
-        x1 = x_i[..., 1]
-        rotated = torch.empty_like(x_i)
-        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
-        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
-        x_i = rotated.flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+def rope_apply_usp(x, grid_sizes, cos, sin):
+    # Unified with rope_apply; keep separate name to minimize diff.
+    return rope_apply(x, grid_sizes, cos, sin)
 
 
 def sp_attn_forward_s2v(self,
@@ -156,8 +141,9 @@ def sp_attn_forward_s2v(self,
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q = rope_apply_usp(q, grid_sizes, freqs)
-    k = rope_apply_usp(k, grid_sizes, freqs)
+    cos, sin = freqs[..., 0], freqs[..., 1]
+    q = rope_apply_usp(q, grid_sizes, cos, sin)
+    k = rope_apply_usp(k, grid_sizes, cos, sin)
 
     x = distributed_attention(
         half(q),
@@ -211,8 +197,8 @@ class WanS2VSelfAttention(WanSelfAttention):
         q, k, v = qkv_fn(x)
 
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs).to(dtype=torch.bfloat16),
-            k=rope_apply(k, grid_sizes, freqs).to(dtype=torch.bfloat16),
+            q=rope_apply(q, grid_sizes, freqs[..., 0], freqs[..., 1]).to(dtype=torch.bfloat16),
+            k=rope_apply(k, grid_sizes, freqs[..., 0], freqs[..., 1]).to(dtype=torch.bfloat16),
             v=v.to(dtype=torch.bfloat16),
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -375,12 +361,13 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+        cos0, sin0 = rope_params(1024, d - 4 * (d // 6))
+        cos1, sin1 = rope_params(1024, 2 * (d // 6))
+        cos2, sin2 = rope_params(1024, 2 * (d // 6))
+        self.freqs = (
+            torch.cat([cos0, cos1, cos2], dim=1),
+            torch.cat([sin0, sin1, sin2], dim=1),
+        )
 
         # initialize weights
         self.init_weights()
@@ -471,7 +458,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                         self.motioner.motion_side_len
                     ]).unsqueeze(0).repeat(1, 1),
                 ]]
-                token_freqs = rope_apply(x, gride_sizes, self.freqs)
+                token_freqs = rope_apply(x, gride_sizes, self.freqs[0], self.freqs[1])
                 token_freqs = token_freqs[0, :,
                                           0].reshape(motion_token_num, -1, 2)
                 token_freqs = token_freqs * 0.01
@@ -553,14 +540,14 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
 
         freqs = self.freqs
         device = self.patch_embedding.weight.device
-        if freqs.device != device:
-            freqs = freqs.to(device)
+        if freqs[0].device != device:
+            freqs = (freqs[0].to(device), freqs[1].to(device))
         if self.trainable_token_pos_emb:
             with amp.autocast(dtype=torch.float64):
                 token_freqs = self.token_freqs.to(torch.float64)
                 token_freqs = token_freqs / token_freqs.norm(
                     dim=-1, keepdim=True)
-                freqs = [freqs, torch.view_as_complex(token_freqs)]
+                freqs = [freqs, (token_freqs[..., 0], token_freqs[..., 1])]
 
         if not drop_motion_frames and add_last_motion:
             last_motion_latent = [u[:, -1:] for u in motion_latents]

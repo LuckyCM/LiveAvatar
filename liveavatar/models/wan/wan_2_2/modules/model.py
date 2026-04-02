@@ -27,50 +27,81 @@ def sinusoidal_embedding_1d(dim, position):
 
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len, dtype=torch.float32),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
-    return freqs
+    # NOTE: keep RoPE params purely real to avoid complex64 on NPU.
+    # Returns:
+    #   cos: [max_seq_len, dim/2]
+    #   sin: [max_seq_len, dim/2]
+    positions = torch.arange(max_seq_len, dtype=torch.float32)
+    inv_freq = 1.0 / torch.pow(theta,
+                               torch.arange(0, dim, 2).to(torch.float32).div(dim))
+    angles = torch.outer(positions, inv_freq)
+    return torch.cos(angles), torch.sin(angles)
 
 @conditional_compile
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-    freqs_real = tuple(f.real.to(torch.float32) for f in freqs)
-    freqs_imag = tuple(f.imag.to(torch.float32) for f in freqs)
+    # split freqs (pure real cos/sin)
+    if (not isinstance(freqs, (tuple, list))) or len(freqs) != 2:
+        raise TypeError(
+            f"wan_2_2 RoPE expects freqs=(cos, sin), got type={type(freqs)}")
+    cos, sin = freqs
+    cos = cos.to(torch.float32)
+    sin = sin.to(torch.float32)
+
+    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+    cos_split = cos.split(split_sizes, dim=1)
+    sin_split = sin.split(split_sizes, dim=1)
+
+    # prefer native NPU rotary op if available
+    use_npu_op = (x.device.type == 'npu')
+    npu_rotary_mul = None
+    if use_npu_op:
+        try:
+            import torch_npu  # type: ignore
+
+            npu_rotary_mul = torch_npu.npu_rotary_mul
+        except Exception:
+            use_npu_op = False
+
+    # operator dtype: keep half/bf16 when possible, otherwise float32
+    half_dtypes = (torch.float16, torch.bfloat16)
+    op_dtype = x.dtype if x.dtype in half_dtypes else torch.float32
 
     # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers (pure real expansion without complex dtype)
-        x_i = x[i, :seq_len].to(torch.float32).reshape(seq_len, n, -1, 2)
-        freqs_i_real = torch.cat([
-            freqs_real[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs_real[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs_real[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        # precompute multipliers (cos/sin, shape [seq_len, 1, c])
+        cos_i = torch.cat([
+            cos_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            cos_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            cos_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-                                 dim=-1).reshape(seq_len, 1, -1)
-        freqs_i_imag = torch.cat([
-            freqs_imag[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs_imag[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs_imag[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+                          dim=-1).reshape(seq_len, 1, -1)
+        sin_i = torch.cat([
+            sin_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            sin_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            sin_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-                                 dim=-1).reshape(seq_len, 1, -1)
+                          dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding via real-imag expansion
-        x0 = x_i[..., 0]
-        x1 = x_i[..., 1]
-        rotated = torch.empty_like(x_i)
-        rotated[..., 0] = x0 * freqs_i_real - x1 * freqs_i_imag
-        rotated[..., 1] = x0 * freqs_i_imag + x1 * freqs_i_real
-        x_i = rotated.flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        # apply rotary embedding
+        x_i = x[i, :seq_len].to(op_dtype)
+        if use_npu_op and npu_rotary_mul is not None:
+            x_i = npu_rotary_mul(x_i, cos_i.to(dtype=op_dtype, device=x_i.device),
+                                 sin_i.to(dtype=op_dtype, device=x_i.device))
+        else:
+            # fallback: pure real math (no complex dtype)
+            x_ri = x_i.to(torch.float32).reshape(seq_len, n, -1, 2)
+            x0 = x_ri[..., 0]
+            x1 = x_ri[..., 1]
+            rotated0 = x0 * cos_i - x1 * sin_i
+            rotated1 = x0 * sin_i + x1 * cos_i
+            x_i = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
+
+        x_i = torch.cat([x_i, x[i, seq_len:]], dim=0)
 
         # append to collection
         output.append(x_i)
@@ -408,12 +439,13 @@ class WanModel(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+        cos0, sin0 = rope_params(1024, d - 4 * (d // 6))
+        cos1, sin1 = rope_params(1024, 2 * (d // 6))
+        cos2, sin2 = rope_params(1024, 2 * (d // 6))
+        self.freqs = (
+            torch.cat([cos0, cos1, cos2], dim=1),
+            torch.cat([sin0, sin1, sin2], dim=1),
+        )
 
         # initialize weights
         self.init_weights()
@@ -449,8 +481,8 @@ class WanModel(ModelMixin, ConfigMixin):
             assert y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+        if self.freqs[0].device != device:
+            self.freqs = (self.freqs[0].to(device), self.freqs[1].to(device))
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
