@@ -24,13 +24,17 @@ def rope_apply(x, grid_sizes, freqs):
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
-    freqs:      [M, C // 2].
+    freqs:      (cos, sin) tuple of [M, C // 2].
     """
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-    freqs_real = tuple(f.real.to(torch.float32) for f in freqs)
-    freqs_imag = tuple(f.imag.to(torch.float32) for f in freqs)
+    
+    if not isinstance(freqs, (tuple, list)) or len(freqs) != 2:
+        raise TypeError("sequence_parallel RoPE expects freqs=(cos, sin)")
+    cos, sin = freqs
+    
+    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+    cos_split = cos.split(split_sizes, dim=1)
+    sin_split = sin.split(split_sizes, dim=1)
 
     # loop over samples
     output = []
@@ -39,18 +43,18 @@ def rope_apply(x, grid_sizes, freqs):
 
         # precompute multipliers
         x_i = x[i, :s].to(torch.float32).reshape(s, n, -1, 2)
+        
         freqs_i_real = torch.cat([
-            freqs_real[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs_real[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs_real[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                                 dim=-1).reshape(seq_len, 1, -1)
+            cos_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            cos_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            cos_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1).to(torch.float32)
+        
         freqs_i_imag = torch.cat([
-            freqs_imag[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs_imag[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs_imag[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                                 dim=-1).reshape(seq_len, 1, -1)
+            sin_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            sin_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            sin_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1).to(torch.float32)
 
         # apply rotary embedding
         sp_size = get_world_size()
@@ -62,16 +66,15 @@ def rope_apply(x, grid_sizes, freqs):
             (sp_rank + 1) * s_per_rank), :, :]
         freqs_i_imag_rank = freqs_i_imag[(sp_rank * s_per_rank):(
             (sp_rank + 1) * s_per_rank), :, :]
+
         x0 = x_i[..., 0]
         x1 = x_i[..., 1]
-        rotated = torch.empty_like(x_i)
-        rotated[..., 0] = x0 * freqs_i_real_rank - x1 * freqs_i_imag_rank
-        rotated[..., 1] = x0 * freqs_i_imag_rank + x1 * freqs_i_real_rank
-        x_i = rotated.flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
+        rotated0 = x0 * freqs_i_real_rank - x1 * freqs_i_imag_rank
+        rotated1 = x0 * freqs_i_imag_rank + x1 * freqs_i_real_rank
+        x_i = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
 
-        # append to collection
-        output.append(x_i)
+        x_out = torch.cat([x_i, x[i, s:]], dim=0)
+        output.append(x_out)
     return torch.stack(output).float()
 
 

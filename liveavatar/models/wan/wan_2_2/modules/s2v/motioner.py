@@ -30,32 +30,36 @@ def sinusoidal_embedding_1d(dim, position):
 @amp.autocast(enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len, dtype=torch.float32),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
-    return freqs
+    positions = torch.arange(max_seq_len, dtype=torch.float32)
+    inv_freq = 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim))
+    angles = torch.outer(positions, inv_freq)
+    return torch.cos(angles), torch.sin(angles)
 
 
 @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    if type(freqs) is list:
+    # split freqs (expecting a tuple (cos, sin) or [(cos, sin), trainable_freqs])
+    if isinstance(freqs, list):
         trainable_freqs = freqs[1]
         freqs = freqs[0]
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    
+    if not isinstance(freqs, (tuple, list)) or len(freqs) != 2:
+        raise TypeError("motioner RoPE expects freqs=(cos, sin)")
+    cos, sin = freqs
+    
+    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+    cos_split = cos.split(split_sizes, dim=1)
+    sin_split = sin.split(split_sizes, dim=1)
 
     # loop over samples
-    output = []
     output = x.clone()
     seq_bucket = [0]
-    if not type(grid_sizes) is list:
+    if not isinstance(grid_sizes, list):
         grid_sizes = [grid_sizes]
     for g in grid_sizes:
-        if not type(g) is list:
+        if not isinstance(g, list):
             g = [torch.zeros_like(g), g]
         batch_size = g[0].shape[0]
         for i in range(batch_size):
@@ -86,26 +90,39 @@ def rope_apply(x, grid_sizes, freqs, start=None):
                                         seq_w).astype(int).tolist()
 
                     assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
-                    freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][
-                        f_sam].conj()
-                    freqs_0 = freqs_0.view(seq_f, 1, 1, -1)
+                    
+                    # For conjugate, cos is same, sin is inverted
+                    cos_0 = cos_split[0][f_sam]
+                    sin_0 = sin_split[0][f_sam] if f_o >= 0 else -sin_split[0][f_sam]
+                    
+                    cos_0 = cos_0.view(seq_f, 1, 1, -1)
+                    sin_0 = sin_0.view(seq_f, 1, 1, -1)
 
-                    freqs_i = torch.cat([
-                        freqs_0.expand(seq_f, seq_h, seq_w, -1),
-                        freqs[1][h_sam].view(1, seq_h, 1, -1).expand(
+                    freqs_i_real = torch.cat([
+                        cos_0.expand(seq_f, seq_h, seq_w, -1),
+                        cos_split[1][h_sam].view(1, seq_h, 1, -1).expand(
                             seq_f, seq_h, seq_w, -1),
-                        freqs[2][w_sam].view(1, 1, seq_w, -1).expand(
+                        cos_split[2][w_sam].view(1, 1, seq_w, -1).expand(
                             seq_f, seq_h, seq_w, -1),
-                    ],
-                                        dim=-1).reshape(seq_len, 1, -1)
+                    ], dim=-1).reshape(seq_len, 1, -1)
+                    
+                    freqs_i_imag = torch.cat([
+                        sin_0.expand(seq_f, seq_h, seq_w, -1),
+                        sin_split[1][h_sam].view(1, seq_h, 1, -1).expand(
+                            seq_f, seq_h, seq_w, -1),
+                        sin_split[2][w_sam].view(1, 1, seq_w, -1).expand(
+                            seq_f, seq_h, seq_w, -1),
+                    ], dim=-1).reshape(seq_len, 1, -1)
                 elif t_f < 0:
-                    freqs_i = trainable_freqs.unsqueeze(1)
+                    # trainable_freqs is a real tensor of shape [..., 2]
+                    freqs_i_real = trainable_freqs[..., 0].unsqueeze(1)
+                    freqs_i_imag = trainable_freqs[..., 1].unsqueeze(1)
+
                 # apply rotary embedding
-                # precompute multipliers
                 x_i = x[i, seq_bucket[-1]:seq_bucket[-1] + seq_len].to(
                     torch.float32).reshape(seq_len, n, -1, 2)
-                freqs_i_real = freqs_i.real.to(torch.float32)
-                freqs_i_imag = freqs_i.imag.to(torch.float32)
+                freqs_i_real = freqs_i_real.to(torch.float32)
+                freqs_i_imag = freqs_i_imag.to(torch.float32)
                 x0 = x_i[..., 0]
                 x1 = x_i[..., 1]
                 rotated = torch.empty_like(x_i)
@@ -464,12 +481,15 @@ class MotionerTransformers(nn.Module, PeftAdapterMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
+        params = [
             rope_params(1024, d - 4 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
             rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+        ]
+        self.freqs = (
+            torch.cat([p[0] for p in params], dim=1),
+            torch.cat([p[1] for p in params], dim=1)
+        )
 
         self.gradient_checkpointing = False
 
@@ -674,12 +694,15 @@ class FramePackMotioner(nn.Module):
         assert (inner_dim %
                 num_heads) == 0 and (inner_dim // num_heads) % 2 == 0
         d = inner_dim // num_heads
-        self.freqs = torch.cat([
+        params = [
             rope_params(1024, d - 4 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
             rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+        ]
+        self.freqs = (
+            torch.cat([p[0] for p in params], dim=1),
+            torch.cat([p[1] for p in params], dim=1)
+        )
         self.drop_mode = drop_mode
 
     def forward(self, motion_latents, add_last_motion=2):
