@@ -191,15 +191,6 @@ def flash_attention(
         q = q * q_scale
 
     if q.device.type == 'npu' and _use_npu_fused_attention():
-        # #region debug-point A:attention-path
-        if not getattr(flash_attention, "_dbg_fused_logged", False):
-            flash_attention._dbg_fused_logged = True
-            import json, urllib.request
-            _p = '.dbg/pixelated-output.env'
-            _u, _s = 'http://127.0.0.1:7777/event', 'pixelated-output'
-            exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass")
-            urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId": _s, "runId": "pre", "hypothesisId": "A", "location": "attention.py:193", "msg": "[DEBUG] fused attention path selected", "data": {"device": q.device.type, "q_dtype": str(q.dtype), "k_dtype": str(k.dtype), "v_dtype": str(v.dtype), "shape_q": list(q.shape), "shape_k": list(k.shape), "shape_v": list(v.shape), "disable_flag": os.getenv("LIVEAVATAR_DISABLE_NPU_FUSED_ATTN", "false")}}).encode(), headers={"Content-Type": "application/json"})).read()
-        # #endregion
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -254,15 +245,6 @@ def flash_attention(
         x = x_bnsd.transpose(1, 2).contiguous()
         return x.type(out_dtype)
     elif q.device.type == 'npu':
-        # #region debug-point A:attention-path-fallback
-        if not getattr(flash_attention, "_dbg_sdpa_logged", False):
-            flash_attention._dbg_sdpa_logged = True
-            import json, urllib.request
-            _p = '.dbg/pixelated-output.env'
-            _u, _s = 'http://127.0.0.1:7777/event', 'pixelated-output'
-            exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass")
-            urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId": _s, "runId": "pre", "hypothesisId": "A", "location": "attention.py:247", "msg": "[DEBUG] sdpa fallback path selected", "data": {"device": q.device.type, "q_dtype": str(q.dtype), "k_dtype": str(k.dtype), "v_dtype": str(v.dtype), "shape_q": list(q.shape), "shape_k": list(k.shape), "shape_v": list(v.shape), "disable_flag": os.getenv("LIVEAVATAR_DISABLE_NPU_FUSED_ATTN", "false")}}).encode(), headers={"Content-Type": "application/json"})).read()
-        # #endregion
         return _sdpa_attention(
             q=q,
             k=k,
