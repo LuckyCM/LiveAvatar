@@ -53,16 +53,6 @@ def rope_apply(x, grid_sizes, freqs):
     cos_split = cos.split(split_sizes, dim=1)
     sin_split = sin.split(split_sizes, dim=1)
 
-    # prefer native NPU rotary op if available
-    use_npu_op = (x.device.type == 'npu')
-    npu_rotary_mul = None
-    if use_npu_op:
-        try:
-            import torch_npu  # type: ignore
-
-            npu_rotary_mul = torch_npu.npu_rotary_mul
-        except Exception:
-            use_npu_op = False
 
     # operator dtype: keep half/bf16 when possible, otherwise float32
     half_dtypes = (torch.float16, torch.bfloat16)
@@ -89,17 +79,13 @@ def rope_apply(x, grid_sizes, freqs):
 
         # apply rotary embedding
         x_i = x[i, :seq_len].to(op_dtype)
-        if use_npu_op and npu_rotary_mul is not None:
-            x_i = npu_rotary_mul(x_i, cos_i.to(dtype=op_dtype, device=x_i.device),
-                                 sin_i.to(dtype=op_dtype, device=x_i.device))
-        else:
-            # fallback: pure real math (no complex dtype)
-            x_ri = x_i.to(torch.float32).reshape(seq_len, n, -1, 2)
-            x0 = x_ri[..., 0]
-            x1 = x_ri[..., 1]
-            rotated0 = x0 * cos_i - x1 * sin_i
-            rotated1 = x0 * sin_i + x1 * cos_i
-            x_i = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
+        # pure real math for interleaved RoPE (no complex dtype, perfectly matches Wan2.2 training semantics)
+        x_ri = x_i.to(torch.float32).reshape(seq_len, n, -1, 2)
+        x0 = x_ri[..., 0]
+        x1 = x_ri[..., 1]
+        rotated0 = x0 * cos_i - x1 * sin_i
+        rotated1 = x0 * sin_i + x1 * cos_i
+        x_i = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
 
         x_i = torch.cat([x_i, x[i, seq_len:]], dim=0)
 

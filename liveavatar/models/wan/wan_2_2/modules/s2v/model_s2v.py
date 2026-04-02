@@ -65,24 +65,15 @@ def torch_dfs(model: nn.Module, parent_name='root'):
 def rope_apply(x, grid_sizes, cos, sin, start=None):
     """Apply RoPE using pure real cos/sin.
 
-    - Prefer `torch_npu.npu_rotary_mul` on NPU.
-    - Fallback to real math expansion on other backends.
+    - Uses pure real math expansion on all backends for mathematical correctness
+      with interleaved (odd-even) weights trained in Wan 2.2.
+    - Avoids npu_rotary_mul because it only supports rotate_half (LLaMA style).
 
     Args:
         x: [B, S, N, D]
-        cos/sin: [B, S, N, D/2] (or broadcastable)
+        cos/sin: broadcastable to [B, S, N, D/2]
     """
     n = x.size(2)
-
-    use_npu_op = (x.device.type == 'npu')
-    npu_rotary_mul = None
-    if use_npu_op:
-        try:
-            import torch_npu  # type: ignore
-
-            npu_rotary_mul = torch_npu.npu_rotary_mul
-        except Exception:
-            use_npu_op = False
 
     half_dtypes = (torch.float16, torch.bfloat16)
     op_dtype = x.dtype if x.dtype in half_dtypes else torch.float32
@@ -91,41 +82,24 @@ def rope_apply(x, grid_sizes, cos, sin, start=None):
     for i, _ in enumerate(x):
         s = x.size(1)
         x_i = x[i, :s].to(op_dtype)
+        
+        # Ensure cos/sin match the device and dtype
         cos_i = cos[i, :s].to(dtype=op_dtype, device=x_i.device)
         sin_i = sin[i, :s].to(dtype=op_dtype, device=x_i.device)
 
-        if use_npu_op and npu_rotary_mul is not None:
-            # torch_npu.npu_rotary_mul on Ascend expects cos/sin broadcastable to x.
-            # In practice, the operator's broadcast check is strict: cos/sin should
-            # have the SAME last-dim as x (e.g. [S, 1, D] or [S, N, D]).
-            # Our RoPE cache is stored as half-dim ([..., D/2]) for real-pair rotation,
-            # so we expand it to match x's last dim when calling the NPU op.
-            cos_npu, sin_npu = cos_i, sin_i
-            # align ranks (e.g. [S, D/2] -> [S, 1, D/2])
-            while cos_npu.dim() < x_i.dim():
-                cos_npu = cos_npu.unsqueeze(1)
-                sin_npu = sin_npu.unsqueeze(1)
-            # expand half-dim cos/sin to full head dim when needed
-            if cos_npu.size(-1) * 2 == x_i.size(-1):
-                cos_npu = cos_npu.repeat_interleave(2, dim=-1)
-                sin_npu = sin_npu.repeat_interleave(2, dim=-1)
-            # if still not compatible, fallback to pure-PyTorch implementation
-            if cos_npu.size(-1) == x_i.size(-1) and sin_npu.size(-1) == x_i.size(-1):
-                x_rot = npu_rotary_mul(x_i, cos_npu, sin_npu)
-            else:
-                x_ri = x_i.to(torch.float32).reshape(s, n, -1, 2)
-                x0 = x_ri[..., 0]
-                x1 = x_ri[..., 1]
-                rotated0 = x0 * cos_i - x1 * sin_i
-                rotated1 = x0 * sin_i + x1 * cos_i
-                x_rot = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
-        else:
-            x_ri = x_i.to(torch.float32).reshape(s, n, -1, 2)
-            x0 = x_ri[..., 0]
-            x1 = x_ri[..., 1]
-            rotated0 = x0 * cos_i - x1 * sin_i
-            rotated1 = x0 * sin_i + x1 * cos_i
-            x_rot = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
+        # reshape for interleaved
+        x_ri = x_i.to(torch.float32).reshape(s, n, -1, 2)
+        x0 = x_ri[..., 0]
+        x1 = x_ri[..., 1]
+        
+        # expand cos_i if needed so it can broadcast
+        while cos_i.dim() < x0.dim():
+            cos_i = cos_i.unsqueeze(1)
+            sin_i = sin_i.unsqueeze(1)
+            
+        rotated0 = x0 * cos_i - x1 * sin_i
+        rotated1 = x0 * sin_i + x1 * cos_i
+        x_rot = torch.stack([rotated0, rotated1], dim=-1).flatten(2)
 
         x_out = torch.cat([x_rot, x[i, s:]], dim=0)
         output.append(x_out)
