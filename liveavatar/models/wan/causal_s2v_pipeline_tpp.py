@@ -180,7 +180,8 @@ class WanS2V:
             self.noise_model = CausalWanModel_S2V.from_pretrained(
                 checkpoint_dir, torch_dtype=self.param_dtype)
         
-        self.noise_model.freqs.to(device=self.device)
+        if hasattr(self.noise_model, 'freqs') and self.noise_model.freqs is not None:
+            self.noise_model.freqs.to(device=self.device)
 
         self.noise_model = self._configure_model(
             model=self.noise_model,
