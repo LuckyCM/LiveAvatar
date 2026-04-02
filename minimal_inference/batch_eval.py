@@ -192,6 +192,12 @@ def _parse_args():
         help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
     )
     parser.add_argument(
+        "--init_on_cpu",
+        type=str2bool,
+        default=None,
+        help="Whether to initialize/offload models on CPU to save device memory."
+    )
+    parser.add_argument(
         "--ulysses_size",
         type=int,
         default=1,
@@ -561,6 +567,13 @@ def generate(args, training_settings):
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
+    if args.init_on_cpu is None:
+        if device_backend in ("cuda", "npu") and args.offload_model is False:
+            args.init_on_cpu = False
+        else:
+            args.init_on_cpu = True
+        logging.info(
+            f"init_on_cpu is not specified, set to {args.init_on_cpu}.")
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(
             backend=default_dist_backend(device_backend),
@@ -662,6 +675,7 @@ def generate(args, training_settings):
             use_sp=(args.ulysses_size > 1),
             sp_size=args.ulysses_size,
             t5_cpu=args.t5_cpu,
+            init_on_cpu=args.init_on_cpu,
             convert_model_dtype=args.convert_model_dtype,
             single_gpu=args.single_gpu,
             offload_kv_cache=args.offload_kv_cache,

@@ -18,10 +18,10 @@ from liveavatar.models.wan.causal_s2v_utils import rollout_grid_sizes
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
-        torch.arange(max_seq_len),
+        torch.arange(max_seq_len, dtype=torch.float32),
         1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
+                        torch.arange(0, dim, 2).to(torch.float32).div(dim)))
+    freqs = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
     return freqs
 
 

@@ -18,6 +18,6 @@ def disable(func):
 
 def conditional_compile(func):
     if COMPILE:
-        return torch.compile(mode=None, backend="inductor", dynamic=None)(func)
+        return torch.compiler.disable(func)
     else:
         return func

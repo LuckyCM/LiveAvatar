@@ -678,7 +678,7 @@ class WanS2V:
             tgt_device = self._device_str(gpu_id)
         else:  # offload
             tgt_device = ("cpu" if self.offload_kv_cache else self._device_str(0)) if self.single_gpu else self._device_str(gpu_id)
-            
+        
         kv_cache1 = self.kv_cache1[str(moved_id)]
         for layer in kv_cache1:
             layer["k"] = layer["k"].to(tgt_device)
@@ -1047,7 +1047,12 @@ class WanS2V:
                         generator=seed_g)
                 ]
                 clip_output = torch.zeros_like(clip_noise[0]) #[16,f,h,w]
-                max_seq_len = int(np.prod(target_shape) // (patch_h * patch_w))
+                padded_lat_frames = int(
+                    (int(lat_target_frames) + int(self.num_frames_per_block) - 1)
+                    // int(self.num_frames_per_block)
+                    * int(self.num_frames_per_block)
+                )
+                max_seq_len = int(padded_lat_frames * frame_seq_length)
                 if self.kv_cache1 is None:
                     if offload_model or self.init_on_cpu:
                         self.noise_model.to(self.device)
@@ -1227,6 +1232,15 @@ class WanS2V:
                     motion_latents = torch.stack(
                         self.vae.encode(videos_last_frames)
                     ).type_as(clip_latents[0])
+                    logging.info(
+                        "Online decoded clip stats: r=%s shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
+                        r,
+                        tuple(image.shape),
+                        float(image.min().item()),
+                        float(image.max().item()),
+                        float(image.float().mean().item()),
+                        float(image.float().std().item()),
+                    )
                     out.append(image.cpu())
                     if offload_model:
                         self.vae.model.cpu()
@@ -1278,6 +1292,15 @@ class WanS2V:
                 motion_latents_pp = torch.stack(
                     self.vae.encode(videos_last_frames)
                 ).type_as(clip_output)
+                logging.info(
+                    "Deferred decoded clip stats: clip_idx=%s shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
+                    clip_idx,
+                    tuple(image.shape),
+                    float(image.min().item()),
+                    float(image.max().item()),
+                    float(image.float().mean().item()),
+                    float(image.float().std().item()),
+                )
                 out.append(image.cpu())
 
         videos = torch.cat(out, dim=2)

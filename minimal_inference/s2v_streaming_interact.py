@@ -166,6 +166,12 @@ def _parse_args():
         help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
     )
     parser.add_argument(
+        "--init_on_cpu",
+        type=str2bool,
+        default=None,
+        help="Whether to initialize/offload models on CPU to save device memory."
+    )
+    parser.add_argument(
         "--ulysses_size",
         type=int,
         default=1,
@@ -419,6 +425,13 @@ def generate(args, training_settings):
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
+    if args.init_on_cpu is None:
+        if device_backend in ("cuda", "npu") and args.offload_model is False:
+            args.init_on_cpu = False
+        else:
+            args.init_on_cpu = True
+        logging.info(
+            f"init_on_cpu is not specified, set to {args.init_on_cpu}.")
     set_device(local_rank, device_backend)
     # Do not initialize distributed for single-process runs.
     if world_size > 1 and not dist.is_initialized():
@@ -532,6 +545,7 @@ def generate(args, training_settings):
             use_sp=(args.ulysses_size > 1),
             sp_size=args.ulysses_size,
             t5_cpu=args.t5_cpu,
+            init_on_cpu=args.init_on_cpu,
             convert_model_dtype=args.convert_model_dtype,
             single_gpu=args.single_gpu,
             offload_kv_cache=args.offload_kv_cache,
@@ -644,6 +658,40 @@ def generate(args, training_settings):
             os.makedirs(args.save_dir, exist_ok=True)
             args.save_file = args.save_dir + args.save_file + suffix
         logging.info(f"Saving generated video to {args.save_file}")
+        first_frame = video[:, 0]
+        mid_frame = video[:, video.shape[1] // 2]
+        last_frame = video[:, -1]
+        neg_sat = float((video <= -0.999).float().mean().item())
+        pos_sat = float((video >= 0.999).float().mean().item())
+        logging.info(
+            "Generated video stats: shape=%s dtype=%s device=%s min=%.6f max=%.6f mean=%.6f",
+            tuple(video.shape),
+            video.dtype,
+            video.device,
+            float(video.min().item()),
+            float(video.max().item()),
+            float(video.float().mean().item()),
+        )
+        logging.info(
+            "Generated video saturation: neg=%.6f pos=%.6f",
+            neg_sat,
+            pos_sat,
+        )
+        logging.info(
+            "Frame stats: first[min=%.6f max=%.6f mean=%.6f std=%.6f] mid[min=%.6f max=%.6f mean=%.6f std=%.6f] last[min=%.6f max=%.6f mean=%.6f std=%.6f]",
+            float(first_frame.min().item()),
+            float(first_frame.max().item()),
+            float(first_frame.float().mean().item()),
+            float(first_frame.float().std().item()),
+            float(mid_frame.min().item()),
+            float(mid_frame.max().item()),
+            float(mid_frame.float().mean().item()),
+            float(mid_frame.float().std().item()),
+            float(last_frame.min().item()),
+            float(last_frame.max().item()),
+            float(last_frame.float().mean().item()),
+            float(last_frame.float().std().item()),
+        )
         save_video(
             tensor=video[None],
             save_file=args.save_file,

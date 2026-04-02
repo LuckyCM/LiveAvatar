@@ -11,6 +11,8 @@ import imageio
 import torch
 import torchvision
 
+import imageio_ffmpeg as ioffmpeg 
+
 __all__ = ['save_video', 'save_image', 'str2bool']
 
 
@@ -45,9 +47,10 @@ def merge_video_audio(video_path: str, audio_path: str):
     temp_output = f"{base}_temp{ext}"
 
     try:
+        ffmpeg_path = ioffmpeg.get_ffmpeg_exe()
         # create ffmpeg command
         command = [
-            'ffmpeg',
+            ffmpeg_path,
             '-y',  # overwrite
             '-i',
             video_path,
