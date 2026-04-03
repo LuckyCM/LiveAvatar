@@ -1107,6 +1107,17 @@ class WanS2V:
                     raise RuntimeError(f"motion_latents contains non-finite values after update: {bad}")
             return out_lat
 
+        def _build_decode_latents(history_latents: torch.Tensor, new_latents: torch.Tensor) -> torch.Tensor:
+            """Build bounded-length VAE decode latents.
+
+            This mirrors avatar_lab's streaming strategy: only keep a fixed amount of
+            motion history (lat_motion_frames) and concatenate with the current chunk.
+            """
+            if int(lat_motion_frames) <= 0:
+                return new_latents.contiguous()
+            history_latents = _ensure_motion_latents_len(history_latents, int(lat_motion_frames))
+            return torch.cat([history_latents, new_latents], dim=2).contiguous()
+
         ref_pixel_values = tensor_trans(model_pic)
         ref_pixel_values = ref_pixel_values.unsqueeze(1).unsqueeze(
             0) * 2 - 1.0  # b c 1 h w
@@ -1119,6 +1130,13 @@ class WanS2V:
         drop_first_motion = False
         motion_latents = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)
         motion_latents = torch.stack(self.vae.encode(motion_latents))
+
+        # Keep a stable/bounded motion history for streaming.
+        motion_latents = _ensure_motion_latents_len(motion_latents, int(lat_motion_frames))
+        # Start motion history for the (optional) deferred VAE post-process decode.
+        # - When `enable_online_decode=True`, this will be advanced once after the first clip.
+        # - When `enable_online_decode=False`, this remains the initial history (decode starts from clip0).
+        motion_latents_vae_start = motion_latents
         
         if drop_motion_noisy:
             zero_motion_latents = torch.zeros_like(motion_latents)
@@ -1446,6 +1464,12 @@ class WanS2V:
 
 
                 #----------------------------------------------Step 2.3: clip-level postprocess---------------------------------
+                # Build bounded decode latents and compute next-step motion history purely in latent space.
+                # This guarantees VAE decode length never grows with chunk count (even if a bug elsewhere
+                # accidentally accumulates motion_latents).
+                decode_latents_for_hist = _build_decode_latents(motion_latents, clip_output.unsqueeze(0))
+                next_motion_latents = _update_motion_latents_from_decode_latents(decode_latents_for_hist).type_as(motion_latents)
+
                 if r == 0 and enable_online_decode:
                     if offload_model:
                         print(f"offloading model to cpu, please wait...")
@@ -1454,9 +1478,7 @@ class WanS2V:
                         device_synchronize(self.device.type)
                         device_empty_cache(self.device.type)
                     ref_latents = clip_output.unsqueeze(0)[:, :, 0:1]
-                    decode_latents = torch.cat(
-                        [motion_latents, clip_output.unsqueeze(0)], dim=2
-                    )
+                    decode_latents = decode_latents_for_hist
 
                     # Profiling anchor: VAE decode time (matches speech2video.py).
                     vae_decode_start = time.perf_counter()
@@ -1474,10 +1496,8 @@ class WanS2V:
                     vae_decode_end = time.perf_counter()
                     vae_decode_time += (vae_decode_end - vae_decode_start)
 
-                    # Update history for next chunk purely in latent space.
-                    motion_latents = _update_motion_latents_from_decode_latents(decode_latents).type_as(
-                        clip_latents[0]
-                    )
+                    # Deferred decode starts from clip1, so advance the starting motion history.
+                    motion_latents_vae_start = next_motion_latents
                     logging.info(
                         "Online decoded clip stats: r=%s shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
                         r,
@@ -1496,6 +1516,9 @@ class WanS2V:
                 else:
                     clip_outputs.append(clip_output.detach().cpu())
 
+                # Advance motion history for the next chunk inference.
+                motion_latents = next_motion_latents
+
         #-------------------------------------- Step 3: full-video postprocess (deferred VAE decode for r>=1)--------------------------------------
         print(f"complete full-sequence generation")
         if clip_outputs:
@@ -1509,14 +1532,12 @@ class WanS2V:
                 device_synchronize(self.device.type)
                 device_empty_cache(self.device.type)
 
-            motion_latents_pp = motion_latents
+            motion_latents_pp = motion_latents_vae_start
             for clip_idx, clip_output_cpu in enumerate(clip_outputs):
                 clip_output = clip_output_cpu.to(
                     device=self.vae.device, dtype=self.vae.dtype
                 )
-                decode_latents = torch.cat(
-                    [motion_latents_pp, clip_output.unsqueeze(0)], dim=2
-                )
+                decode_latents = _build_decode_latents(motion_latents_pp, clip_output.unsqueeze(0))
 
                 # Profiling anchor: VAE decode time (deferred decode path).
                 vae_decode_start = time.perf_counter()
