@@ -1061,6 +1061,16 @@ class WanS2V:
             clip_outputs = []
             self.kv_cache1 = None
             self.shared_cond_cache = None  
+
+            # Ensure NPU torch.compile (TorchAir) injection runs regardless of offload/init_on_cpu flags.
+            # This must happen before any noise_model forward (e.g., denoising loop).
+            if self.device.type == "npu":
+                # Make sure model is on NPU before compiling.
+                # (When offload/init_on_cpu is False, noise_model is expected to already be on device.)
+                if offload_model or self.init_on_cpu:
+                    self.noise_model.to(self.device)
+                self._maybe_enable_npu_torch_compile()
+
             active_nr = min(max_repeat, num_repeat)
             for r in range(active_nr):
             #-------------------------------------------rollout loop------------------------------------------------------
@@ -1104,8 +1114,6 @@ class WanS2V:
                 if self.kv_cache1 is None:
                     if offload_model or self.init_on_cpu:
                         self.noise_model.to(self.device)
-                        # Enable TorchAir torch.compile after the model is on NPU.
-                        self._maybe_enable_npu_torch_compile()
                         self.vae.model.cpu()
                         self.text_encoder.model.cpu()
                         self.audio_encoder.model.cpu()
@@ -1155,8 +1163,6 @@ class WanS2V:
 
                 if offload_model or self.init_on_cpu:
                     self.noise_model.to(self.device)
-                    # In case the model was offloaded/reloaded, ensure compile is enabled once.
-                    self._maybe_enable_npu_torch_compile()
                     self.vae.model.cpu()
                     device_empty_cache(self.device.type)
 
