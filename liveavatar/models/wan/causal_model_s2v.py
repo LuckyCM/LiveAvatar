@@ -73,6 +73,19 @@ def _ensure_kv_cache_len(kv_cache: dict, key: str, required_len: int) -> None:
     new_t[:, : t.shape[1]] = t
     kv_cache[key] = new_t
 
+
+def _get_packed_kv_buffers(kv_cache: dict) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Return (k_packed, v_packed, cond_cap, kv_len) from a layer kv_cache dict."""
+    if "k_packed" not in kv_cache or "v_packed" not in kv_cache:
+        raise KeyError("kv_cache is missing packed KV buffers: expected keys 'k_packed'/'v_packed'.")
+    k_packed = kv_cache["k_packed"]
+    v_packed = kv_cache["v_packed"]
+    if "k" not in kv_cache:
+        raise KeyError("kv_cache is missing key 'k' (required to infer kv_len).")
+    kv_len = int(kv_cache["k"].shape[1])
+    cond_cap = int(k_packed.shape[1]) - int(kv_len)
+    return k_packed, v_packed, cond_cap, kv_len
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to reduce-overhead for better distributed training performance
@@ -175,22 +188,26 @@ def sp_attn_forward_s2v(self,
             if global_seg_idx[1]-global_seg_idx[0] > 0: #streaming inference
                 kv_cache["k"][:, current_start:(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank] = k[:,global_seg_idx[0]:global_seg_idx[1]]
                 kv_cache["v"][:, current_start:(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank] = v[:,global_seg_idx[0]:global_seg_idx[1]]
+
+                # Static packed KV: [cond | kv] with kv starting at cond_end.
+                k_packed, v_packed, cond_cap, kv_len = _get_packed_kv_buffers(kv_cache)
+                kv_offset = int(kv_cache["cond_end"])  # 0 <= kv_offset <= cond_cap
+                if kv_offset < 0 or kv_offset > int(cond_cap):
+                    raise RuntimeError(f"Invalid cond_end={kv_offset} with cond_cap={cond_cap}.")
+                if int(current_start) + int(global_seg_idx[1] - global_seg_idx[0]) > int(kv_len):
+                    raise RuntimeError(
+                        f"KV write exceeds kv_len: current_start={int(current_start)}, "
+                        f"append_len={int(global_seg_idx[1]-global_seg_idx[0])}, kv_len={int(kv_len)}"
+                    )
+                k_packed[:, kv_offset + current_start:kv_offset + current_start + (global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank] = k[:,global_seg_idx[0]:global_seg_idx[1]]
+                v_packed[:, kv_offset + current_start:kv_offset + current_start + (global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank] = v[:,global_seg_idx[0]:global_seg_idx[1]]
+
                 x = flash_attention(
                     q=q[:,global_seg_idx[0]:global_seg_idx[1]],
-                    k=torch.cat(
-                                [
-                                kv_cache["k"][:, :(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank],
-                                kv_cache["cond_k"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank]
-                                ],dim=1
-                                ),
-                    v=torch.cat(
-                                [
-                                kv_cache["v"][:, :(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank],
-                                kv_cache["cond_v"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank]
-                                ],dim=1
-                                ),
+                    k=k_packed[:, :, head_start_rank:head_end_rank],
+                    v=v_packed[:, :, head_start_rank:head_end_rank],
                     k_lens=torch.tensor(
-                        current_start + (global_seg_idx[1] - global_seg_idx[0]) + int(kv_cache["cond_end"]),
+                        kv_offset + current_start + (global_seg_idx[1] - global_seg_idx[0]),
                         device=q.device,
                         dtype=torch.int32,
                     ).repeat(b),
@@ -199,11 +216,20 @@ def sp_attn_forward_s2v(self,
             elif global_seg_idx[2]-global_seg_idx[1] > 0: #prefill cond caching
                 # assert False, "not implemented for prefill sp"
                 required_cond_len = int(global_seg_idx[2] - global_seg_idx[1])
-                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), required_cond_len)
-                _ensure_kv_cache_len(kv_cache, "cond_k", int(kv_cache["cond_end"]))
-                _ensure_kv_cache_len(kv_cache, "cond_v", int(kv_cache["cond_end"]))
+                cond_cap = int(kv_cache["cond_k"].shape[1])
+                if required_cond_len > cond_cap:
+                    raise RuntimeError(
+                        f"required_cond_len ({required_cond_len}) exceeds cond cache capacity ({cond_cap}). "
+                        "Increase `cond_cache_init_len` / `_cond_cache_size` to keep shapes static."
+                    )
+                kv_cache["cond_end"][0] = required_cond_len
                 kv_cache["cond_k"][:, :required_cond_len, head_start_rank:head_end_rank] = k[:,global_seg_idx[1]:global_seg_idx[2]]
                 kv_cache["cond_v"][:, :required_cond_len, head_start_rank:head_end_rank] = v[:,global_seg_idx[1]:global_seg_idx[2]]
+
+                # Write into packed buffer prefix [0:cond_end]
+                k_packed, v_packed, _, _ = _get_packed_kv_buffers(kv_cache)
+                k_packed[:, :required_cond_len, head_start_rank:head_end_rank] = k[:,global_seg_idx[1]:global_seg_idx[2]]
+                v_packed[:, :required_cond_len, head_start_rank:head_end_rank] = v[:,global_seg_idx[1]:global_seg_idx[2]]
 
                 x = flash_attention(
                     q=q,
@@ -357,24 +383,24 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
 
                 kv_cache["k"][:, current_start:(current_start + seg_len_block)] = roped_key[:, seg_idx[0]:seg_idx[1]]
                 kv_cache["v"][:, current_start:(current_start + seg_len_block)] = v[:, seg_idx[0]:seg_idx[1]]
+
+                # Static packed KV: [cond | kv] with kv starting at cond_end.
+                k_packed, v_packed, cond_cap, kv_len = _get_packed_kv_buffers(kv_cache)
+                kv_offset = int(kv_cache["cond_end"])  # 0 <= kv_offset <= cond_cap
+                if kv_offset < 0 or kv_offset > int(cond_cap):
+                    raise RuntimeError(f"Invalid cond_end={kv_offset} with cond_cap={cond_cap}.")
+                if int(current_start) + int(seg_len_block) > int(kv_len):
+                    raise RuntimeError(
+                        f"KV write exceeds kv_len: current_start={int(current_start)}, append_len={int(seg_len_block)}, kv_len={int(kv_len)}"
+                    )
+                k_packed[:, kv_offset + current_start:kv_offset + current_start + seg_len_block] = roped_key[:, seg_idx[0]:seg_idx[1]]
+                v_packed[:, kv_offset + current_start:kv_offset + current_start + seg_len_block] = v[:, seg_idx[0]:seg_idx[1]]
                 x = flash_attention(
                     q=roped_query[:,seg_idx[0]:seg_idx[1]],
-                    k=torch.cat(
-                                [
-                                kv_cache["k"][:, active_kv_cache_start:active_kv_cache_size],
-                                causal_rope_apply_cond(
-                                    kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond[..., 0], freqs_cond[..., 1]
-                                    ).type_as(v)
-                                ],dim=1
-                                ),
-                    v=torch.cat(
-                                [
-                                kv_cache["v"][:, active_kv_cache_start:active_kv_cache_size],
-                                kv_cache["cond_v"][:, :active_cond_cache_size]
-                                ],dim=1
-                                ),
+                    k=k_packed,
+                    v=v_packed,
                     k_lens=torch.tensor(
-                        active_kv_cache_size - active_kv_cache_start + active_cond_cache_size,
+                        kv_offset + active_kv_cache_size,
                         device=q.device,
                         dtype=torch.int32,
                     ).repeat(b),
@@ -384,18 +410,32 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 roped_query = causal_rope_apply_cond(
                     q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v) #grid_sizes不参与计算
                 required_cond_len = int(seg_idx[2] - seg_idx[1])
-                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), required_cond_len)
-                _ensure_kv_cache_len(kv_cache, "cond_k", int(kv_cache["cond_end"]))
-                _ensure_kv_cache_len(kv_cache, "cond_v", int(kv_cache["cond_end"]))
-                kv_cache["cond_k"][:, :required_cond_len] = k[:,seg_idx[1]:seg_idx[2]]
-                kv_cache["cond_v"][:, :required_cond_len] = v[:,seg_idx[1]:seg_idx[2]]
+                cond_cap = int(kv_cache["cond_k"].shape[1])
+                if required_cond_len > cond_cap:
+                    raise RuntimeError(
+                        f"required_cond_len ({required_cond_len}) exceeds cond cache capacity ({cond_cap}). "
+                        "Increase `cond_cache_init_len` / `_cond_cache_size` to keep shapes static."
+                    )
+                kv_cache["cond_end"][0] = required_cond_len
+                cond_k_raw = k[:,seg_idx[1]:seg_idx[2]]
+                cond_v_raw = v[:,seg_idx[1]:seg_idx[2]]
+                kv_cache["cond_k"][:, :required_cond_len] = cond_k_raw
+                kv_cache["cond_v"][:, :required_cond_len] = cond_v_raw
+
+                # Write roped cond-K / V into packed buffer prefix [0:cond_end]
+                k_packed, v_packed, _, _ = _get_packed_kv_buffers(kv_cache)
+                if freqs_cond is None:
+                    raise RuntimeError("freqs_cond is required for static packed cond KV.")
+                cond_k_roped = causal_rope_apply_cond(
+                    cond_k_raw, None, freqs_cond[..., 0], freqs_cond[..., 1]
+                ).type_as(v)
+                k_packed[:, :required_cond_len] = cond_k_roped
+                v_packed[:, :required_cond_len] = cond_v_raw
                 x = flash_attention(
                     q=roped_query[:,seg_idx[1]:seg_idx[2]],
-                    k=causal_rope_apply_cond(
-                            k, grid_sizes, freqs[..., 0], freqs[..., 1]
-                        ).type_as(v)[:,:int(kv_cache["cond_end"])],
-                    v=kv_cache["cond_v"][:, :int(kv_cache["cond_end"])],
-                    k_lens=torch.tensor(int(kv_cache["cond_end"]), device=q.device, dtype=torch.int32).repeat(b),
+                    k=k_packed[:, :required_cond_len],
+                    v=v_packed[:, :required_cond_len],
+                    k_lens=torch.tensor(required_cond_len, device=q.device, dtype=torch.int32).repeat(b),
                     window_size=self.window_size
                 )
             else:

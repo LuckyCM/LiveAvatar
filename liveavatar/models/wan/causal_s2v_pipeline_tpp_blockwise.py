@@ -672,8 +672,9 @@ class WanS2V:
         kv_cache1 = []
 
         for _ in range(self.noise_model.num_layers):
+            # Fixed cond capacity for torch.compile shape stability.
             cond_init_len = int(getattr(self, "cond_cache_init_len", 1))
-            cond_init_len = max(1, min(cond_init_len, self._cond_cache_size))
+            cond_init_len = max(1, min(cond_init_len, int(self._cond_cache_size)))
             kv_cache1.append(
                 {
                     "k": torch.zeros(
@@ -686,7 +687,19 @@ class WanS2V:
                         dtype=dtype,
                         device=device,
                     ),
-                    # Resolution-dependent; grow on demand in model forward.
+                    # Static packed KV buffer: [cond | kv]
+                    "k_packed": torch.zeros(
+                        [batch_size, cond_init_len + kv_cache_size, self._num_heads, self._head_dim],
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "v_packed": torch.zeros(
+                        [batch_size, cond_init_len + kv_cache_size, self._num_heads, self._head_dim],
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "cond_cap": int(cond_init_len),
+                    # Fixed cond cache; do NOT grow on demand.
                     "cond_k": torch.zeros(
                         [batch_size, cond_init_len, self._num_heads, self._head_dim],
                         dtype=dtype,
@@ -717,6 +730,8 @@ class WanS2V:
         for layer in kv_cache1:
             layer["k"] = layer["k"].to(tgt_device)
             layer["v"] = layer["v"].to(tgt_device)
+            layer["k_packed"] = layer["k_packed"].to(tgt_device)
+            layer["v_packed"] = layer["v_packed"].to(tgt_device)
             layer["cond_k"] = layer["cond_k"].to(tgt_device)
             layer["cond_v"] = layer["cond_v"].to(tgt_device)
         self.kv_cache1[str(moved_id)] = kv_cache1

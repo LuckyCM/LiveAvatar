@@ -680,9 +680,27 @@ class WanS2V:
         kv_cache1 = []
 
         for layer_idx in range(self.noise_model.num_layers):
+            # cond cache capacity (static). We keep the original heuristic but do NOT grow it dynamically
+            # in model forward to keep torch.compile shapes stable.
+            cond_cap = int(getattr(self, "cond_cache_init_len", 1))
+            cond_cap = max(1, min(cond_cap, int(self._cond_cache_size)))
+
             layer_cache = {
                 "k": torch.zeros([batch_size, kv_cache_size, self._num_heads, self._head_dim], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, self._num_heads, self._head_dim], dtype=dtype, device=device),
+                # Static packed KV buffer: [cond | kv]
+                # Layout is intentionally packed to avoid per-step `torch.cat` dynamic shapes.
+                "k_packed": torch.zeros(
+                    [batch_size, cond_cap + kv_cache_size, self._num_heads, self._head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
+                "v_packed": torch.zeros(
+                    [batch_size, cond_cap + kv_cache_size, self._num_heads, self._head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
+                "cond_cap": cond_cap,
             }
             
             if not self.offload_kv_cache and hasattr(self, 'shared_cond_cache') and self.shared_cond_cache is not None:
@@ -690,9 +708,8 @@ class WanS2V:
                 layer_cache["cond_v"] = self.shared_cond_cache[layer_idx]["cond_v"]
                 layer_cache["cond_end"] = self.shared_cond_cache[layer_idx]["cond_end"]
             else:
-                # Resolution-dependent; grow on demand in model forward.
-                cond_init_len = int(getattr(self, "cond_cache_init_len", 1))
-                cond_init_len = max(1, min(cond_init_len, self._cond_cache_size))
+                # Resolution-dependent; fixed capacity for compile stability.
+                cond_init_len = int(cond_cap)
                 layer_cache["cond_k"] = torch.zeros(
                     [batch_size, cond_init_len, self._num_heads, self._head_dim],
                     dtype=dtype,
@@ -723,6 +740,8 @@ class WanS2V:
         for layer in kv_cache1:
             layer["k"] = layer["k"].to(tgt_device)
             layer["v"] = layer["v"].to(tgt_device)
+            layer["k_packed"] = layer["k_packed"].to(tgt_device)
+            layer["v_packed"] = layer["v_packed"].to(tgt_device)
             if self.offload_kv_cache or not hasattr(self, 'shared_cond_cache') or self.shared_cond_cache is None:
                 layer["cond_k"] = layer["cond_k"].to(tgt_device)
                 layer["cond_v"] = layer["cond_v"].to(tgt_device)

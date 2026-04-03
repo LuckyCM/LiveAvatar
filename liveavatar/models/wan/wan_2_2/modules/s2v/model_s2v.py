@@ -60,6 +60,109 @@ def torch_dfs(model: nn.Module, parent_name='root'):
         modules += child_modules
     return modules, module_names
 
+
+class WanStaticKVCache:
+    """Static KV Cache 管理器（TorchAir/Ascend 友好）。
+
+    设计目标：
+    - 一次性预分配固定大小的 KV 显存池，避免每步 `torch.cat` 扩容导致的动态 shape。
+    - 写入使用 `scatter_`（而非 `pos:pos+s` slice assign / `index_copy_`），减少
+      torch.compile functionalization 引入的大量 `aten.slice_scatter`。
+
+    约定：
+    - `k_cache/v_cache` 的 shape 为 [Layers, B, Total_L, H, D]
+    - 其中前 `max_seq_len` 为 streaming/noisy token 区间；后 `cond_max_seq_len`
+      为 cond token 区间（可为 0）。
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        batch_size: int,
+        max_seq_len: int,
+        num_heads: int,
+        head_dim: int,
+        device,
+        dtype,
+        cond_max_seq_len: int = 0,
+    ):
+        self.num_layers = int(num_layers)
+        self.batch_size = int(batch_size)
+        self.max_seq_len = int(max_seq_len)
+        self.cond_max_seq_len = int(cond_max_seq_len)
+        self.total_seq_len = int(self.max_seq_len + self.cond_max_seq_len)
+
+        if self.max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be > 0, got {self.max_seq_len}")
+        if self.cond_max_seq_len < 0:
+            raise ValueError(f"cond_max_seq_len must be >= 0, got {self.cond_max_seq_len}")
+
+        # [Layers, B, Total_L, H, D]
+        self.k_cache = torch.empty(
+            (self.num_layers, self.batch_size, self.total_seq_len, int(num_heads), int(head_dim)),
+            device=device,
+            dtype=dtype,
+        )
+        self.v_cache = torch.empty(
+            (self.num_layers, self.batch_size, self.total_seq_len, int(num_heads), int(head_dim)),
+            device=device,
+            dtype=dtype,
+        )
+
+        # 每层 cond 的有效长度（streaming 有效长度由上层逻辑决定）
+        self.cond_end = torch.zeros((self.num_layers,), device=device, dtype=torch.long)
+
+        # 预构建索引，避免热路径 `torch.arange`（更利于 TorchAir/GE 图稳定）
+        self._seq_idx = torch.arange(self.total_seq_len, device=device, dtype=torch.long)
+
+    @property
+    def cond_offset(self) -> int:
+        return int(self.max_seq_len)
+
+    def reset(self) -> None:
+        # 不主动清零缓存内容，仅重置有效长度指针。
+        self.cond_end.zero_()
+
+    def to(self, device: str | torch.device):
+        """就地迁移缓存到目标 device（用于 offload / 多卡搬运）。"""
+        self.k_cache = self.k_cache.to(device)
+        self.v_cache = self.v_cache.to(device)
+        self.cond_end = self.cond_end.to(device)
+        self._seq_idx = self._seq_idx.to(device)
+        return self
+
+    def set_cond_end(self, layer_id: int, new_end: int) -> None:
+        layer = int(layer_id)
+        v = int(new_end)
+        if v < 0:
+            v = 0
+        if v > int(self.cond_max_seq_len):
+            raise RuntimeError(
+                f"cond_end ({v}) exceeds cond_max_seq_len ({int(self.cond_max_seq_len)})."
+            )
+        self.cond_end[layer] = v
+
+    def write_kv(self, layer_id: int, pos: int, k: torch.Tensor, v: torch.Tensor, *, offset: int = 0) -> None:
+        """将 [B, S, H, D] 写入到 cache 的序列维 dim=2 的指定位置。"""
+        layer = int(layer_id)
+        pos_i = int(pos) + int(offset)
+        s = int(k.size(1))
+
+        if s <= 0:
+            return
+        if pos_i < 0 or pos_i + s > int(self.total_seq_len):
+            raise RuntimeError(
+                f"KV write out of bounds: pos={pos_i}, append_len={s}, total_seq_len={int(self.total_seq_len)}"
+            )
+
+        # scatter_ 的 index 需要与 dst 同 rank
+        idx_1d = self._seq_idx.narrow(0, pos_i, s)
+        idx = idx_1d.view(1, s, 1, 1).expand(int(k.size(0)), s, int(k.size(2)), int(k.size(3)))
+
+        # 选择 layer 后，序列维为 dim=1
+        self.k_cache[layer].scatter_(1, idx, k)
+        self.v_cache[layer].scatter_(1, idx, v)
+
 @amp.autocast(enabled=False)
 @conditional_compile
 def rope_apply(x, grid_sizes, cos, sin, start=None):
