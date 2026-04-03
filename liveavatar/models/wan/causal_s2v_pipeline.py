@@ -872,7 +872,10 @@ class WanS2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
-        start = time.time()
+        # NOTE(perf): Align profiling anchors with avatar_lab's
+        # `/workspace/avatar_lab/veomni/models/custom/wan_s2v/speech2video.py`.
+        # Use `time.perf_counter()` (monotonic, high-resolution) for all timers.
+        start = time.perf_counter()
         condition_end = None
         real_dit_time = 0.0
         vae_decode_time = 0.0
@@ -1128,7 +1131,8 @@ class WanS2V:
         dataset_info = {}
 
         print("complete prepare conditional inputs")
-        condition_end = time.time()
+        # Profiling anchor: end of condition preparation (matches speech2video.py).
+        condition_end = time.perf_counter()
 
         def _build_sample_scheduler(solver_name: str):
             """Build sampling scheduler for inference.
@@ -1300,13 +1304,11 @@ class WanS2V:
                         }
                         timestep = torch.ones(
                             [1, self.num_frames_per_block], device=self.device, dtype=self.param_dtype) * 0
-                        dit_start = time.time()
                         self.noise_model( #update clean kv cache
                             [block_latents], t=timestep*0, **block_arg_c, 
                             kv_cache=self.kv_cache1[str(gpu_id+1)], crossattn_cache=self.crossattn_cache,
                             current_start=block_index * self.num_frames_per_block * frame_seq_length,
                             current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length)
-                        real_dit_time += time.time() - dit_start
                         
                         self._move_kv_cache_to_working_gpu(gpu_id+1, gpu_id+1) # move to gpu0
 
@@ -1363,14 +1365,21 @@ class WanS2V:
                         timestep = torch.tensor(timestep).to(self.device).unsqueeze(0)
 
                         self._move_kv_cache_to_working_gpu(i+1)# i+1 gpu -> 0
-                        dit_start = time.time()
+
+                        # Profiling anchor: Pure DiT time (model forward only).
+                        # Exclude KV-cache movement/offload/scheduler overhead.
+                        device_synchronize(self.device.type)
+                        dit_start = time.perf_counter()
                         noise_pred_cond = self.noise_model(
                             [latent_model_input], t=timestep, **block_arg_c, 
                             kv_cache=self.kv_cache1[str(i+1)], crossattn_cache=self.crossattn_cache,
                             current_start=block_index * self.num_frames_per_block * frame_seq_length + r * num_blocks * self.num_frames_per_block * frame_seq_length,
                             current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length + r * num_blocks *self.num_frames_per_block * frame_seq_length,
                             mask=mask)
-                        real_dit_time += time.time() - dit_start
+
+                        device_synchronize(self.device.type)
+                        dit_end = time.perf_counter()
+                        real_dit_time += (dit_end - dit_start)
 
                         noise_pred = [torch.cat(noise_pred_cond, dim=0)]
                         self._move_kv_cache_to_working_gpu(i+1,i+1)# i+1 gpu -> 0
@@ -1398,13 +1407,22 @@ class WanS2V:
                     decode_latents = torch.cat(
                         [motion_latents, clip_output.unsqueeze(0)], dim=2
                     )
-                    vae_decode_start = time.time()
-                    image = torch.stack(self.vae.decode(decode_latents))
-                    vae_decode_time += time.time() - vae_decode_start
+
+                    # Profiling anchor: VAE decode time (matches speech2video.py).
+                    vae_decode_start = time.perf_counter()
+                    image = torch.stack(
+                        self.vae.decode(
+                            decode_latents.to(dtype=self.vae.dtype, device=self.vae.device)
+                        )
+                    )
                     image = image[:, :, -(infer_frames):]
                     image = image[:, :, 3:]
+
                     if first_frame is None:
-                        first_frame = time.time()
+                        first_frame = time.perf_counter()
+
+                    vae_decode_end = time.perf_counter()
+                    vae_decode_time += (vae_decode_end - vae_decode_start)
 
                     # Update history for next chunk purely in latent space.
                     motion_latents = _update_motion_latents_from_decode_latents(decode_latents).type_as(
@@ -1450,15 +1468,21 @@ class WanS2V:
                     [motion_latents_pp, clip_output.unsqueeze(0)], dim=2
                 )
 
-                vae_decode_start = time.time()
-                image = torch.stack(self.vae.decode(decode_latents))
-                vae_decode_time += time.time() - vae_decode_start
+                # Profiling anchor: VAE decode time (deferred decode path).
+                vae_decode_start = time.perf_counter()
+                image = torch.stack(
+                    self.vae.decode(
+                        decode_latents.to(dtype=self.vae.dtype, device=self.vae.device)
+                    )
+                )
                 image = image[:, :, -(infer_frames):]
                 if first_frame is None:
-                    first_frame = time.time()
+                    first_frame = time.perf_counter()
                 
                 if not enable_online_decode and clip_idx == 0:
                     image = image[:, :, 3:]
+                vae_decode_end = time.perf_counter()
+                vae_decode_time += (vae_decode_end - vae_decode_start)
 
                 # Update history for next chunk purely in latent space.
                 motion_latents_pp = _update_motion_latents_from_decode_latents(decode_latents).type_as(
@@ -1491,19 +1515,20 @@ class WanS2V:
             device_synchronize(self.device.type)
             device_empty_cache(self.device.type)
 
-        gen_end = time.time()
-        io_scheduler_time = (gen_end - condition_end) - real_dit_time - vae_decode_time
-        print("condition prepare time: ", condition_end - start)
-        print("IO/Scheduler time (may be negative due to overlap): ", io_scheduler_time)
-        print("Pure DiT time: ", real_dit_time)
-        print("vae decode time: ", vae_decode_time)
-        if first_frame is not None:
-            print("first frame time: ", first_frame - start)
-        if deferred_vae_callback is not None:
-            print("deferred enqueue time: ", deferred_enqueue_time)
-        print("gen time: ", gen_end - start)
-        if videos is not None:
-            print("gen frames: ", videos.shape[2])
+        gen_end = time.perf_counter()
+        if self.rank == 0:
+            print("condition prepare time: ", condition_end - start)
+            io_scheduler_time = (gen_end - condition_end) - real_dit_time - vae_decode_time
+            print("IO/Scheduler time (may be negative due to overlap): ", io_scheduler_time)
+            print("Pure DiT time: ", real_dit_time)
+            print("vae decode time: ", vae_decode_time)
+            if first_frame is not None:
+                print("first frame time: ", first_frame - start)
+            if deferred_vae_callback is not None:
+                print("deferred enqueue time: ", deferred_enqueue_time)
+            print("gen time: ", gen_end - start)
+            if videos is not None:
+                print("gen frames: ", videos.shape[2])
 
         return videos[0] if self.rank == 0 else None, dataset_info
 
