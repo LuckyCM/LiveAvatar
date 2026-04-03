@@ -1009,6 +1009,41 @@ class WanS2V:
         lat_motion_frames = (self.motion_frames + (vae_t - 1)) // vae_t
         model_pic = crop_opreat(resize_opreat(Image.fromarray(ref_image)))
 
+        def _ensure_motion_latents_len(lat: torch.Tensor, target_t: int) -> torch.Tensor:
+            """Force motion latent temporal length to `target_t`.
+
+            - If too long: keep the most recent (tail) frames.
+            - If too short: left-pad with zeros.
+            """
+            cur_t = int(lat.shape[2])
+            if cur_t == int(target_t):
+                return lat
+            if cur_t > int(target_t):
+                return lat[:, :, cur_t - int(target_t) : cur_t].contiguous()
+            pad_t = int(target_t) - cur_t
+            pad = lat.new_zeros((lat.shape[0], lat.shape[1], pad_t, lat.shape[3], lat.shape[4]))
+            return torch.cat([pad, lat], dim=2).contiguous()
+
+        def _update_motion_latents_from_decode_latents(decode_latents: torch.Tensor) -> torch.Tensor:
+            """Update motion history purely by latent slicing (no VAE decode->encode round-trip)."""
+            if int(lat_motion_frames) <= 0:
+                return decode_latents[:, :, :0].contiguous()
+            if os.environ.get("WAN_S2V_DEBUG_STREAMING", "0") == "1":
+                if not torch.isfinite(decode_latents).all():
+                    bad = (~torch.isfinite(decode_latents)).sum().item()
+                    raise RuntimeError(f"decode_latents contains non-finite values: {bad}")
+
+            if int(decode_latents.shape[2]) >= int(lat_motion_frames):
+                out_lat = decode_latents[:, :, -int(lat_motion_frames) :].contiguous()
+            else:
+                out_lat = _ensure_motion_latents_len(decode_latents.contiguous(), int(lat_motion_frames))
+
+            if os.environ.get("WAN_S2V_DEBUG_STREAMING", "0") == "1":
+                if not torch.isfinite(out_lat).all():
+                    bad = (~torch.isfinite(out_lat)).sum().item()
+                    raise RuntimeError(f"motion_latents contains non-finite values after update: {bad}")
+            return out_lat
+
         ref_pixel_values = tensor_trans(model_pic)
         ref_pixel_values = ref_pixel_values.unsqueeze(1).unsqueeze(
             0) * 2 - 1.0  # b c 1 h w
@@ -1020,7 +1055,6 @@ class WanS2V:
         # drop_first_motion = self.drop_first_motion
         drop_first_motion = False
         motion_latents = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)
-        videos_last_frames = motion_latents.detach()
         motion_latents = torch.stack(self.vae.encode(motion_latents))
         
         if drop_motion_noisy:
@@ -1284,20 +1318,10 @@ class WanS2V:
                     if first_frame is None:
                         first_frame = time.time()
 
-                    overlap_frames_num = min(self.motion_frames, image.shape[2])
-                    videos_last_frames = torch.cat(
-                        [
-                            videos_last_frames[:, :, overlap_frames_num:],
-                            image[:, :, -overlap_frames_num:],
-                        ],
-                        dim=2,
+                    # Update history for next chunk purely in latent space.
+                    motion_latents = _update_motion_latents_from_decode_latents(decode_latents).type_as(
+                        clip_latents[0]
                     )
-                    videos_last_frames = videos_last_frames.to(
-                        dtype=motion_latents.dtype, device=motion_latents.device
-                    )
-                    motion_latents = torch.stack(
-                        self.vae.encode(videos_last_frames)
-                    ).type_as(clip_latents[0])
                     logging.info(
                         "Online decoded clip stats: r=%s shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
                         r,
@@ -1348,20 +1372,10 @@ class WanS2V:
                 if not enable_online_decode and clip_idx == 0:
                     image = image[:, :, 3:]
 
-                overlap_frames_num = min(self.motion_frames, image.shape[2])
-                videos_last_frames = torch.cat(
-                    [
-                        videos_last_frames[:, :, overlap_frames_num:],
-                        image[:, :, -overlap_frames_num:],
-                    ],
-                    dim=2,
+                # Update history for next chunk purely in latent space.
+                motion_latents_pp = _update_motion_latents_from_decode_latents(decode_latents).type_as(
+                    clip_output
                 )
-                videos_last_frames = videos_last_frames.to(
-                    dtype=motion_latents_pp.dtype, device=motion_latents_pp.device
-                )
-                motion_latents_pp = torch.stack(
-                    self.vae.encode(videos_last_frames)
-                ).type_as(clip_output)
                 logging.info(
                     "Deferred decoded clip stats: clip_idx=%s shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
                     clip_idx,
