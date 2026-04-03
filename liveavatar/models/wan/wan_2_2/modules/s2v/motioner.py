@@ -18,13 +18,16 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    # Keep float32 to avoid unsupported/expensive float64 on accelerators (e.g. NPU).
+    position = position.to(dtype=torch.float32)
 
-    # calculation
-    sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x
+    # calculation (keep float32 end-to-end)
+    freqs = torch.exp(
+        (-math.log(10000.0))
+        * (torch.arange(half, device=position.device, dtype=torch.float32).div(half))
+    )
+    sinusoid = torch.outer(position, freqs)
+    return torch.cat([sinusoid.cos(), sinusoid.sin()], dim=1)
 
 
 @amp.autocast(enabled=False)
@@ -535,11 +538,10 @@ class MotionerTransformers(nn.Module, PeftAdapterMixin):
             freqs = freqs.to(device)
 
         if self.trainable_token_pos_emb:
-            with amp.autocast(dtype=torch.float64):
-                token_freqs = self.token_freqs.to(torch.float64)
-                token_freqs = token_freqs / token_freqs.norm(
-                    dim=-1, keepdim=True)
-                freqs = [freqs, torch.view_as_complex(token_freqs)]
+            # Keep trainable freqs in (cos, sin) real-pair form.
+            token_freqs = self.token_freqs.to(torch.float32)
+            token_freqs = token_freqs / token_freqs.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            freqs = [freqs, token_freqs]
 
         if self.enable_tsm:
             sample_idx = [

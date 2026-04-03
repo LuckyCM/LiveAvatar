@@ -128,8 +128,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         self._step_index = None
         self._begin_index = None
 
-        self.sigmas = self.sigmas.to(
-            "cpu")  # to avoid too much CPU/GPU communication
+        # Keep sigmas on device; CPU sigmas would break device ops in `step()` on NPU/CUDA.
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
 
@@ -208,7 +207,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         sigmas = np.concatenate([sigmas, [sigma_last]
                                 ]).astype(np.float32)  # pyright: ignore
 
-        self.sigmas = torch.from_numpy(sigmas)
+        # Keep sigmas on the same device as the denoising loop.
+        self.sigmas = torch.from_numpy(sigmas).to(device=device, dtype=torch.float32)
         self.timesteps = torch.from_numpy(timesteps).to(
             device=device, dtype=torch.int64)
 
@@ -225,8 +225,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to(
-            "cpu")  # to avoid too much CPU/GPU communication
+        # Keep sigmas on device; CPU sigmas would break device ops in `step()` on NPU/CUDA.
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:

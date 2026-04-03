@@ -1117,12 +1117,34 @@ class WanS2V:
 
         print("complete prepare conditional inputs")
         condition_end = time.time()
-        if sample_solver == 'euler':#default
-            sample_scheduler = FlowMatchEulerDiscreteScheduler(
-                num_train_timesteps=self.num_train_timesteps,
-                shift=3)
-        else:
-            raise NotImplementedError("Unsupported solver.")
+
+        def _build_sample_scheduler(solver_name: str):
+            """Build sampling scheduler for inference.
+
+            NOTE(Ascend 910B): keep scheduler tensors on device; do NOT rely on CPU
+            sigmas/timesteps (would break device ops).
+            """
+            name = str(solver_name).lower().strip()
+            if name in ("euler", "flow_euler", "fm_euler"):
+                return FlowMatchEulerDiscreteScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=float(shift),
+                )
+            if name in ("unipc", "uni_pc"):
+                return FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                )
+            if name in ("dpm++", "dpmpp", "dpm_solver++", "dpmsolver++", "dpm"):
+                return FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                )
+            raise NotImplementedError(f"Unsupported solver: {solver_name}")
+
+        sample_scheduler = _build_sample_scheduler(sample_solver)
 
 
         #--------------------------------------Step 2: generate--------------------------------------
@@ -1279,15 +1301,29 @@ class WanS2V:
                 num_blocks = target_shape[0] // self.num_frames_per_block
                 for block_index in range(num_blocks):
                     # 2.2.1 prepare block-level cond
+                    sampler_key = (str(sample_solver), int(sampling_steps), float(shift))
+                    if getattr(self, '_sampler_cache_key', None) != sampler_key:
+                        self._sampler_cache_key = sampler_key
+                        self._sampler_timesteps = None
+                        self._sampler_sigmas = None
+
                     if getattr(self, '_sampler_timesteps', None) is None:
-                        sample_scheduler.set_timesteps(
-                            sampling_steps, device=self.device)
+                        # Prefer passing `shift` into our local few-step schedulers.
+                        try:
+                            sample_scheduler.set_timesteps(
+                                int(sampling_steps), device=self.device, shift=float(shift)
+                            )
+                        except TypeError:
+                            sample_scheduler.set_timesteps(
+                                int(sampling_steps), device=self.device
+                            )
                         self._sampler_timesteps = sample_scheduler.timesteps
-                        self._sampler_sigmas = sample_scheduler.sigmas
+                        self._sampler_sigmas = getattr(sample_scheduler, "sigmas", None)
 
                     timesteps = self._sampler_timesteps
                     sample_scheduler.timesteps = timesteps
-                    sample_scheduler.sigmas = self._sampler_sigmas
+                    if getattr(self, '_sampler_sigmas', None) is not None and hasattr(sample_scheduler, "sigmas"):
+                        sample_scheduler.sigmas = self._sampler_sigmas
                     sample_scheduler._step_index = dist.get_rank() if dist.is_initialized() else 0
                     sample_scheduler._begin_index = 0
 
@@ -1430,6 +1466,7 @@ class WanS2V:
         del clip_noise, clip_latents, clip_output, block_latents
         self._sampler_timesteps = None
         self._sampler_sigmas = None
+        self._sampler_cache_key = None
         self.kv_cache1 = None
         self.shared_cond_cache = None
         self.crossattn_cache = None

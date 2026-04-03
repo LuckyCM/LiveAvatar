@@ -32,15 +32,26 @@ class CausalAudioEncoder(nn.Module):
         self.act = torch.nn.SiLU()
 
     def forward(self, features):
-        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        # NOTE(Ascend/TorchAir):
+        # - Avoid `amp.autocast(enabled=False)` in compiled graphs (it may call into
+        #   torch_npu runtime queries like bf16 support checks and cause graph breaks).
+        # - Avoid `nn.Module.to(...)` inside forward (can trigger graph breaks + recompiles).
+        #
         # features: [B, num_layers, dim, video_length]
-        features_fp32 = features.float()
-        weights = self.act(self.weights.float())
+        weights = self.act(self.weights)
         weights_sum = weights.sum(dim=1, keepdims=True)
-        weighted_feat = ((features_fp32 * weights) / weights_sum).sum(dim=1)  # b dim f
-        weighted_feat = weighted_feat.permute(0, 2, 1).contiguous()  # b f dim
-        res = self.encoder(weighted_feat)  # b f n dim
-        return res  # b f n dim
+        weighted_feat = ((features.to(torch.float32) * weights.to(torch.float32)) / weights_sum.to(torch.float32)).sum(dim=1)  # [B, dim, F]
+        weighted_feat = weighted_feat.permute(0, 2, 1).contiguous()  # [B, F, dim]
+        res = self.encoder(weighted_feat)
+
+        if isinstance(res, torch.Tensor):
+            return res.to(dtype=features.dtype)
+
+        # MotionEncoder_tc returns a tuple (global, local) when need_global=True.
+        return (
+            res[0].to(dtype=features.dtype),
+            res[1].to(dtype=features.dtype),
+        )
 
 
 class AudioCrossAttention(WanCrossAttention):
