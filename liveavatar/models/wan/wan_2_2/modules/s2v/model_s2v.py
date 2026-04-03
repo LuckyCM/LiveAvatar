@@ -269,10 +269,11 @@ class Head_S2V(Head):
             e(Tensor): Shape [B,  C]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1) #modulation:nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)  +[b,1,dim] ->[b,2,dim]->chunk->tuple(2)*[b,1,dim]
-            x = (self.head(self.norm(x) * (1 + e[1]) + e[0])) #[b,seq_len,dim]
-        return x.to(dtype=torch.bfloat16)
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = (self.modulation.to(dtype=torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
+        x_fp32 = self.norm(x).float() * (1 + e[1]) + e[0]
+        x_fp32 = self.head(x_fp32)
+        return x_fp32.to(dtype=torch.bfloat16)
 
 
 class WanS2VSelfAttention(WanSelfAttention):
@@ -332,8 +333,8 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         seg_idx = [0, seg_idx, x.size(1)]
         e = e[0] # [1,6,2,5120]
         modulation = self.modulation.unsqueeze(2) # [1, 6, 5120]->[1, 6, 1, 5120]
-        with amp.autocast(dtype=torch.float32):
-            e = (modulation + e).chunk(6, dim=1) # tuple(6)*torch.Size([1, 1, 2, 5120])
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = (modulation.to(dtype=torch.float32) + e).chunk(6, dim=1) # tuple(6)*torch.Size([1, 1, 2, 5120])
         assert e[0].dtype == torch.float32
 
         e = [element.squeeze(1) for element in e]
@@ -346,12 +347,12 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         norm_x = torch.cat(parts, dim=1).to(dtype=torch.bfloat16)
         # self-attention
         y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs,sp_size=self.sp_size)
-        with amp.autocast(dtype=torch.float32):
-            z = []
-            for i in range(2):
-                z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[2][:, i:i + 1])
-            y = torch.cat(z, dim=1)
-            x = x + y
+        y_fp32 = y.float()
+        z = []
+        for i in range(2):
+            z.append(y_fp32[:, seg_idx[i]:seg_idx[i + 1]] * e[2][:, i:i + 1])
+        y = torch.cat(z, dim=1)
+        x = (x.float() + y).to(dtype=torch.bfloat16)
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
@@ -362,12 +363,12 @@ class WanS2VAttentionBlock(WanAttentionBlock):
                              (1 + e[4][:, i:i + 1]) + e[3][:, i:i + 1])
             norm2_x = torch.cat(parts, dim=1).to(dtype=torch.bfloat16)
             y = self.ffn(norm2_x)
-            with amp.autocast(dtype=torch.float32):
-                z = []
-                for i in range(2):
-                    z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[5][:, i:i + 1])
-                y = torch.cat(z, dim=1)
-                x = x + y
+            y_fp32 = y.float()
+            z = []
+            for i in range(2):
+                z.append(y_fp32[:, seg_idx[i]:seg_idx[i + 1]] * e[5][:, i:i + 1])
+            y = torch.cat(z, dim=1)
+            x = x.float() + y
             return x.to(dtype=torch.bfloat16)
 
         x = cross_attn_ffn(x.to(dtype=torch.bfloat16), context, context_lens, e).to(dtype=torch.bfloat16)
@@ -912,11 +913,11 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)]) # [b]->[b+1],默认为 true
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float()) # t:[b+1],output:[b+1,dim]
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim)) # [b+1,6,dim]
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).float()) # t:[b+1],output:[b+1,dim]
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim)) # [b+1,6,dim]
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         if self.zero_timestep:
             e = e[:-1] # [b,dim]

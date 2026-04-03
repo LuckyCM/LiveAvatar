@@ -86,6 +86,37 @@ def _get_packed_kv_buffers(kv_cache: dict) -> tuple[torch.Tensor, torch.Tensor, 
     cond_cap = int(k_packed.shape[1]) - int(kv_len)
     return k_packed, v_packed, cond_cap, kv_len
 
+
+def _align_rope_freqs(freqs: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Align RoPE cache length to the current (possibly padded) sequence length.
+
+    Static KV cache can keep attention tensors padded to a fixed length, while
+    RoPE freqs may be generated/sliced by the *effective* k_lens. This helper
+    ensures RoPE tensors and Q/K tensors always have matching sequence length.
+
+    Expected freqs shape: [B, L, N, C, 2] where last dim is (cos, sin).
+    """
+    if not isinstance(freqs, torch.Tensor):
+        raise TypeError(f"freqs must be a torch.Tensor, got {type(freqs)}")
+    if target_len < 0:
+        raise ValueError(f"target_len must be >= 0, got {target_len}")
+    if freqs.dim() < 2:
+        return freqs
+    cur_len = int(freqs.shape[1])
+    if cur_len == target_len:
+        return freqs
+    if cur_len > target_len:
+        return freqs[:, :target_len]
+
+    pad_len = target_len - cur_len
+    pad_shape = list(freqs.shape)
+    pad_shape[1] = pad_len
+    pad = torch.zeros(pad_shape, device=freqs.device, dtype=freqs.dtype)
+    # Identity rotation for padded positions: cos=1, sin=0
+    if pad.numel() > 0:
+        pad[..., 0] = 1.0
+    return torch.cat([freqs, pad], dim=1)
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to reduce-overhead for better distributed training performance
@@ -118,6 +149,10 @@ def sp_attn_forward_s2v(self,
             v = self.v(x).view(b, s, n, d)
             return q, k, v
         q, k, v = qkv_fn(x)
+
+        # Static KV cache may keep Q/K/V padded to a fixed length, while RoPE freqs
+        # can be generated/sliced by effective k_lens. Always align to current seq len.
+        freqs = _align_rope_freqs(freqs, int(s))
         roped_query = rope_apply_usp(q, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
         roped_key = rope_apply_usp(k, grid_sizes, freqs[..., 0], freqs[..., 1]).type_as(v)
 
@@ -271,11 +306,12 @@ class CausalHead_S2V(Head):
         original_dtype = x.dtype
         batch_size,num_frames = x.shape[0],e.shape[0] // x.shape[0]
         frame_seqlen =x.shape[1] // num_frames
-        with amp.autocast(dtype=torch.float32):
-            
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)#modulation:nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)  +[b*F,1,dim] ->[B*F,2,dim]->chunk->tuple(2)*[b*F,1,dim]
-            x = (self.head( (self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) # unflatten后: [b,F,frame_seqlen,dim],    e[0]:[b*F,1,dim]->[b,F,1,dim],
-                          * (1 + e[1].unflatten(dim=0, sizes=(batch_size,num_frames))) + e[0].unflatten(dim=0, sizes=(batch_size,num_frames))).flatten(1, 2)) ) #[b,L1,dim]
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = (self.modulation.to(dtype=torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
+        norm_x = self.norm(x).float().unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+        e1 = e[1].unflatten(dim=0, sizes=(batch_size, num_frames))
+        e0 = e[0].unflatten(dim=0, sizes=(batch_size, num_frames))
+        x = self.head((norm_x * (1 + e1) + e0).flatten(1, 2))  # [b,L1,dim]
         return x.to(original_dtype)
 
 
@@ -426,6 +462,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 k_packed, v_packed, _, _ = _get_packed_kv_buffers(kv_cache)
                 if freqs_cond is None:
                     raise RuntimeError("freqs_cond is required for static packed cond KV.")
+                freqs_cond = _align_rope_freqs(freqs_cond, required_cond_len)
                 cond_k_roped = causal_rope_apply_cond(
                     cond_k_raw, None, freqs_cond[..., 0], freqs_cond[..., 1]
                 ).type_as(v)
@@ -486,8 +523,8 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         e = e[0]  # [B, F, 6, 2, C]
         
         modulation = self.modulation.unsqueeze(1).unsqueeze(3)  # [1, 6, 1536]->[1, 1, 6, 1, 1536]
-        with amp.autocast(dtype=torch.float32):
-            e = (modulation + e).chunk(6, dim=2) # [B,F,6,2,dim]->tuple(6)*[B,F,1,2,dim]
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = (modulation.to(dtype=torch.float32) + e).chunk(6, dim=2) # [B,F,6,2,dim]->tuple(6)*[B,F,1,2,dim]
         assert e[0].dtype == torch.float32
 
         e = [element.squeeze(2) for element in e] # tuple(6)*[B,F,2,dim]
@@ -529,9 +566,8 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
             frame_seqlen=frame_seqlen,
         )  # [b,l,dim]
 
-        with amp.autocast(dtype=torch.float32):
-            y = y * e[2]
-            x = x + y
+        # e is fp32, keep multiply in fp32 then cast back
+        x = x + (y.float() * e[2]).type_as(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
@@ -541,9 +577,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
             
             y = self.ffn(norm2_x.type_as(bf_dtype_tensor))
 
-            with amp.autocast(dtype=torch.float32):
-                y = y * e[5]
-                x = x + y
+            x = x + (y.float() * e[5]).type_as(x)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e).type_as(bf_dtype_tensor)
@@ -1096,14 +1130,14 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)]) # [b,F]->[b+1,F],默认为 true
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
-            e0 = self.time_projection(e).unflatten(
-                1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
-            e = e.to(torch.float32)
-            e0 = e0.to(torch.float32)
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e0 = self.time_projection(e).unflatten(
+            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
+        e = e.to(torch.float32)
+        e0 = e0.to(torch.float32)
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
 
         
@@ -1318,14 +1352,14 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)]) # [b,F]->[b+1,F],默认为 true
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
-            e0 = self.time_projection(e).unflatten(
-                1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
-            e = e.to(torch.float32)
-            e0 = e0.to(torch.float32)
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e0 = self.time_projection(e).unflatten(
+            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
+        e = e.to(torch.float32)
+        e0 = e0.to(torch.float32)
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
 
         
@@ -1578,12 +1612,12 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)]) # [b,F]->[b+1,F],默认为 true
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
-            e0 = self.time_projection(e).unflatten(
-                1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e0 = self.time_projection(e).unflatten(
+            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape) # output:[b+1,F,6,dim]
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
         
         if self.zero_timestep:
             e = e[:-1*t.shape[1]] # [bF,dim]

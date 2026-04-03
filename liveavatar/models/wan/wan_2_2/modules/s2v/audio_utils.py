@@ -32,15 +32,14 @@ class CausalAudioEncoder(nn.Module):
         self.act = torch.nn.SiLU()
 
     def forward(self, features):
-        with amp.autocast(dtype=torch.float32):
-            # features B * num_layers * dim * video_length
-            weights = self.act(self.weights)
-            weights_sum = weights.sum(dim=1, keepdims=True)
-            weighted_feat = ((features * weights) / weights_sum).sum(
-                dim=1)  # b dim f
-            weighted_feat = weighted_feat.permute(0, 2, 1)  # b f dim
-            res = self.encoder(weighted_feat)  # b f n dim
-
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Compute in fp32 directly.
+        # features: [B, num_layers, dim, video_length]
+        features_fp32 = features.float()
+        weights = self.act(self.weights.float())
+        weights_sum = weights.sum(dim=1, keepdims=True)
+        weighted_feat = ((features_fp32 * weights) / weights_sum).sum(dim=1)  # b dim f
+        weighted_feat = weighted_feat.permute(0, 2, 1).contiguous()  # b f dim
+        res = self.encoder(weighted_feat)  # b f n dim
         return res  # b f n dim
 
 

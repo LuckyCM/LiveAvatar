@@ -16,6 +16,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
+from liveavatar.utils.device_backend import autocast as device_autocast
+
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
@@ -331,7 +333,11 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                device_autocast(
+                    device_type=self.device.type,
+                    dtype=self.param_dtype,
+                    enabled=self.device.type in ("cuda", "npu"),
+                ),
                 torch.no_grad(),
                 no_sync(),
         ):
@@ -523,7 +529,11 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                device_autocast(
+                    device_type=self.device.type,
+                    dtype=self.param_dtype,
+                    enabled=self.device.type in ("cuda", "npu"),
+                ),
                 torch.no_grad(),
                 no_sync(),
         ):

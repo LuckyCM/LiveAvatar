@@ -486,16 +486,16 @@ class WanModel(ModelMixin, ConfigMixin):
         ])
 
         # time embeddings
+        # NOTE: Do not use autocast(dtype=float32) on Ascend NPU. Just compute in fp32.
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
-            bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, seq_len)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        bt = t.size(0)
+        t = t.flatten()
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim,
+                                    t).unflatten(0, (bt, seq_len)).float())
+        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         context_lens = None

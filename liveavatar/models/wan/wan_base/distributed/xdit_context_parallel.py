@@ -115,11 +115,11 @@ def usp_dit_forward(
     ])
 
     # time embeddings
-    with amp.autocast(dtype=torch.float32):
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).float())
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+    # NOTE: On Ascend NPU, autocast(dtype=float32) is not supported. Compute in fp32 directly.
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t).float())
+    e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+    assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
     # context
     context_lens = None

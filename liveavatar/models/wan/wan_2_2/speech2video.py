@@ -21,6 +21,8 @@ from safetensors import safe_open
 from torchvision import transforms
 from tqdm import tqdm
 
+from liveavatar.utils.device_backend import autocast as device_autocast
+
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
@@ -551,7 +553,11 @@ class WanS2V:
         out = []
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                device_autocast(
+                    device_type=self.device.type,
+                    dtype=self.param_dtype,
+                    enabled=self.device.type in ("cuda", "npu"),
+                ),
                 torch.no_grad(),
         ):
             for r in range(num_repeat):
