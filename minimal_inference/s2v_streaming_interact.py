@@ -713,6 +713,13 @@ def generate(args, training_settings):
         print(f"rank {rank} start destroying process group...")
         dist.destroy_process_group()
 
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        max_mem = torch.npu.max_memory_allocated() / (1024 ** 3)
+        logging.info(f"🚀 [Memory Profiler] NPU Max Memory Allocated: {max_mem:.2f} GB")
+    elif torch.cuda.is_available():
+        max_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        logging.info(f"🚀 [Memory Profiler] CUDA Max Memory Allocated: {max_mem:.2f} GB")
+    
     logging.info("Finished.")
 
 
