@@ -242,16 +242,40 @@ class WanS2V:
             return
 
         try:
-            config = torchair.CompilerConfig()
-            config.debug.graph_dump.type = "pbtxt"
-            npu_backend = torchair.get_compiler(config=config)
+            # TorchAir API may differ across versions. Some versions don't accept
+            # `config=` kwarg for `get_compiler`, while others do.
+            config = None
+            if hasattr(torchair, "CompilerConfig"):
+                config = torchair.CompilerConfig()
+                try:
+                    # Optional debug knob (may not exist in some builds)
+                    config.debug.graph_dump.type = "pbtxt"
+                except Exception:
+                    pass
+
+            npu_backend = None
+            if hasattr(torchair, "get_compiler"):
+                try:
+                    # Newer TorchAir
+                    npu_backend = torchair.get_compiler(config=config) if config is not None else torchair.get_compiler()
+                except TypeError:
+                    # Older TorchAir: positional config or different kw names
+                    if config is not None:
+                        try:
+                            npu_backend = torchair.get_compiler(config)
+                        except TypeError:
+                            for kw in ("compiler_config", "cfg"):
+                                try:
+                                    npu_backend = torchair.get_compiler(**{kw: config})
+                                    break
+                                except TypeError:
+                                    continue
+
+            # If TorchAir backend is unavailable, fall back to plain NPU backend.
+            backend = npu_backend if npu_backend is not None else "npu"
 
             print("==== 强行开启 NPU Torch.Compile ====")
-            self.noise_model = torch.compile(
-                self.noise_model,
-                backend=npu_backend,
-                dynamic=True,
-            )
+            self.noise_model = torch.compile(self.noise_model, backend=backend, dynamic=True)
         except Exception as e:
             # Keep original behavior if compilation fails.
             print(f"[TorchAir] NPU torch.compile 注入失败，回退为未编译模型: {e}")

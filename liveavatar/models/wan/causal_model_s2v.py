@@ -1164,6 +1164,11 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             sp_size=self.sp_size,
             in_sink_forward=True,
             )
+
+        # Static packed cond KV cache requires a dedicated RoPE cache for the
+        # cond segment. In sink prefill, the sequence is purely cond tokens
+        # (seg_idx == 0), so we can directly reuse the precomputed freqs.
+        cond_pre_compute_freqs = self.pre_compute_freqs
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
                 return module(*inputs, **kwargs)
@@ -1175,7 +1180,8 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                     "kv_cache": kv_cache[idx],
                     "crossattn_cache": crossattn_cache[idx],
                     "current_start": current_start,
-                    "current_end": current_end
+                    "current_end": current_end,
+                    "freqs_cond": cond_pre_compute_freqs,
                 }
             )
             if torch.is_grad_enabled() and self.gradient_checkpointing:
