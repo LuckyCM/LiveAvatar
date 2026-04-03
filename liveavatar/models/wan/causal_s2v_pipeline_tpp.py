@@ -38,6 +38,7 @@ from .causal_model_s2v import CausalWanModel_S2V, sp_attn_forward_s2v
 from .wan_2_2.modules.t5 import T5EncoderModel
 from .wan_2_2.utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
+    FlowMatchScheduler,
     get_sampling_sigmas,
     retrieve_timesteps,
 )
@@ -155,10 +156,18 @@ class WanS2V:
         else:
             # Backward-compat: some runners still pass `fewstep_fm`.
             _cfg_solver = str(getattr(config, "sample_solver", "")).lower().strip()
-            if _cfg_solver in ('euler', 'fewstep_fm', 'few_step_fm', 'fewstep-fm'):
+            if _cfg_solver in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                self.sample_scheduler = FlowMatchScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=3,
+                    sigma_min=0.0,
+                    extra_one_step=True,
+                )
+            elif _cfg_solver == "euler":
                 self.sample_scheduler = FlowMatchEulerDiscreteScheduler(
                     num_train_timesteps=self.num_train_timesteps,
-                    shift=3)
+                    shift=3,
+                )
             elif _cfg_solver == 'unipc':#default
                 self.sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
@@ -1027,12 +1036,19 @@ class WanS2V:
 
         print("complete prepare conditional inputs")
         _sample_solver = str(sample_solver).lower().strip()
-        if _sample_solver in ('euler', 'fewstep_fm', 'few_step_fm', 'fewstep-fm'):#default
+        if _sample_solver in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+            sample_scheduler = FlowMatchScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=float(shift),
+                sigma_min=0.0,
+                extra_one_step=True,
+            )
+        elif _sample_solver in ("euler", "flow_euler", "fm_euler"):
             sample_scheduler = FlowMatchEulerDiscreteScheduler(
                 num_train_timesteps=self.num_train_timesteps,
                 shift=3)
         else:
-            raise NotImplementedError("Unsupported solver.")
+            raise NotImplementedError(f"Unsupported solver: {sample_solver}")
         self._initialize_comm_group(num_gpus_dit=num_gpus_dit, enable_vae_parallel=enable_vae_parallel)
         in_dit_device = dist.get_rank() < num_gpus_dit
         dist.barrier() # wait all ranks to finish initialization
@@ -1153,19 +1169,32 @@ class WanS2V:
                 for block_index in range(num_blocks):
                     # 2.2.1 prepare block-level cond
                     if getattr(self, '_sampler_timesteps', None) is None:
-                        sample_scheduler.set_timesteps(
-                            sampling_steps, device=self.device)
-                        self._sampler_timesteps = sample_scheduler.timesteps
-                        self._sampler_sigmas = sample_scheduler.sigmas
+                        if _sample_solver in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                            denoising_timesteps = [999, 748, 502, 247]
+                            den_idx = self.num_train_timesteps - torch.tensor(
+                                denoising_timesteps, dtype=torch.long
+                            )
+                            self._sampler_timesteps = sample_scheduler.timesteps[den_idx].to(self.device)
+                            self._sampler_sigmas = None
+                        else:
+                            sample_scheduler.set_timesteps(
+                                sampling_steps, device=self.device)
+                            self._sampler_timesteps = sample_scheduler.timesteps
+                            self._sampler_sigmas = sample_scheduler.sigmas
 
                     timesteps = self._sampler_timesteps
                     sample_scheduler.timesteps = timesteps
-                    sample_scheduler.sigmas = self._sampler_sigmas
-                    sample_scheduler._step_index = dist.get_rank() 
-                    sample_scheduler._begin_index = 0
+                    if self._sampler_sigmas is not None and hasattr(sample_scheduler, "sigmas"):
+                        sample_scheduler.sigmas = self._sampler_sigmas
+                    if hasattr(sample_scheduler, "_step_index"):
+                        sample_scheduler._step_index = dist.get_rank()
+                    if hasattr(sample_scheduler, "_begin_index"):
+                        sample_scheduler._begin_index = 0
 
                     block_latents = clip_latents[0][:, block_index *
                                 self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
+                    block_noise = clip_noise[0][:, block_index *
+                                self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block]
                     if r==0 or in_dit_device:
                         block_frames = self.num_frames_per_block * vae_t
                         left_idx = block_index * block_frames
@@ -1204,13 +1233,31 @@ class WanS2V:
 
                         noise_pred = [torch.cat(noise_pred_cond, dim=0)]
 
-                        temp_x0 = sample_scheduler.step(
-                            noise_pred[0].unsqueeze(0),# [16,f,h,w]
-                            t,
-                            latent_model_input.unsqueeze(0), #[1,16,f,h,w]
-                            return_dict=False,
-                            generator=seed_g)[0]
-                        block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
+                        if _sample_solver in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                            t_tensor = t
+                            if not isinstance(t_tensor, torch.Tensor):
+                                t_tensor = torch.tensor(float(t), device=latent_model_input.device)
+                            sigma_t = (t_tensor.to(dtype=latent_model_input.dtype, device=latent_model_input.device) /
+                                       float(self.num_train_timesteps))
+                            while sigma_t.ndim < latent_model_input.ndim:
+                                sigma_t = sigma_t.unsqueeze(-1)
+                            x0_pred = latent_model_input - sigma_t * noise_pred[0]
+
+                            if i < len(timesteps) - 1:
+                                next_t = timesteps[i + 1]
+                                block_latents = sample_scheduler.add_noise(
+                                    x0_pred, block_noise, next_t
+                                ).to(dtype=latent_model_input.dtype, device=latent_model_input.device)
+                            else:
+                                block_latents = x0_pred
+                        else:
+                            temp_x0 = sample_scheduler.step(
+                                noise_pred[0].unsqueeze(0),# [16,f,h,w]
+                                t,
+                                latent_model_input.unsqueeze(0), #[1,16,f,h,w]
+                                return_dict=False,
+                                generator=seed_g)[0]
+                            block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
                         if self.tgt_gpu is None:
                             pass
                         else:

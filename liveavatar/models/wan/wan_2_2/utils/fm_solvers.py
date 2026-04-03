@@ -922,31 +922,47 @@ class FlowMatchScheduler():
             self.training = False
 
     def step(self, model_output, timestep, sample, to_final=False, **kwargs):
+        """Single Flow-Matching update.
+
+        NOTE(Ascend/NPU): keep arithmetic on the caller's device.
+        We only use CPU tensors to *lookup* the nearest sigma, then cast to Python floats
+        to avoid cross-device scalar tensor ops.
+        """
         if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
-        if to_final or timestep_id + 1 >= len(self.timesteps):
-            sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
+            t_val = timestep.detach().reshape(-1)[0].to(device=self.timesteps.device, dtype=self.timesteps.dtype)
         else:
-            sigma_ = self.sigmas[timestep_id + 1]
-        prev_sample = sample + model_output * (sigma_ - sigma)
+            t_val = torch.tensor(float(timestep), device=self.timesteps.device, dtype=self.timesteps.dtype)
+
+        timestep_id = int(torch.argmin((self.timesteps - t_val).abs()).item())
+        sigma = float(self.sigmas[timestep_id].item())
+        if to_final or timestep_id + 1 >= len(self.timesteps):
+            sigma_next = 1.0 if (self.inverse_timesteps or self.reverse_sigmas) else 0.0
+        else:
+            sigma_next = float(self.sigmas[timestep_id + 1].item())
+
+        prev_sample = sample + model_output * (sigma_next - sigma)
         return prev_sample
 
     def return_to_timestep(self, timestep, sample, sample_stablized):
         if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
+            t_val = timestep.detach().reshape(-1)[0].to(device=self.timesteps.device, dtype=self.timesteps.dtype)
+        else:
+            t_val = torch.tensor(float(timestep), device=self.timesteps.device, dtype=self.timesteps.dtype)
+
+        timestep_id = int(torch.argmin((self.timesteps - t_val).abs()).item())
+        sigma = float(self.sigmas[timestep_id].item())
         model_output = (sample - sample_stablized) / sigma
         return model_output
     
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
-        sample = (1 - sigma) * original_samples + sigma * noise
+            t_val = timestep.detach().reshape(-1)[0].to(device=self.timesteps.device, dtype=self.timesteps.dtype)
+        else:
+            t_val = torch.tensor(float(timestep), device=self.timesteps.device, dtype=self.timesteps.dtype)
+
+        timestep_id = int(torch.argmin((self.timesteps - t_val).abs()).item())
+        sigma = float(self.sigmas[timestep_id].item())
+        sample = (1.0 - sigma) * original_samples + sigma * noise
         return sample
 
     def training_target(self, sample, noise, timestep):

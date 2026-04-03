@@ -38,6 +38,7 @@ from .wan_2_2.modules.t5 import T5EncoderModel
 from .wan_2_2.modules.vae2_1 import Wan2_1_VAE
 from .wan_2_2.utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
+    FlowMatchScheduler,
     get_sampling_sigmas,
     retrieve_timesteps,
 )
@@ -152,10 +153,18 @@ class WanS2V:
         else:
             # Backward-compat: some runners still pass `fewstep_fm`.
             _cfg_solver = str(getattr(config, "sample_solver", "")).lower().strip()
-            if _cfg_solver in ('euler', 'fewstep_fm', 'few_step_fm', 'fewstep-fm'):
+            if _cfg_solver in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                self.sample_scheduler = FlowMatchScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=3,
+                    sigma_min=0.0,
+                    extra_one_step=True,
+                )
+            elif _cfg_solver == "euler":
                 self.sample_scheduler = FlowMatchEulerDiscreteScheduler(
                     num_train_timesteps=self.num_train_timesteps,
-                    shift=3)
+                    shift=3,
+                )
             elif _cfg_solver == 'unipc':  # default
                 self.sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
@@ -1141,8 +1150,14 @@ class WanS2V:
             sigmas/timesteps (would break device ops).
             """
             name = str(solver_name).lower().strip()
-            # Backward-compat: treat `fewstep_fm` as FlowMatch Euler.
-            if name in ("euler", "flow_euler", "fm_euler", "fewstep_fm", "few_step_fm", "fewstep-fm"):
+            if name in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                return FlowMatchScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=float(shift),
+                    sigma_min=0.0,
+                    extra_one_step=True,
+                )
+            if name in ("euler", "flow_euler", "fm_euler"):
                 return FlowMatchEulerDiscreteScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=float(shift),
@@ -1162,6 +1177,7 @@ class WanS2V:
             raise NotImplementedError(f"Unsupported solver: {solver_name}")
 
         sample_scheduler = _build_sample_scheduler(sample_solver)
+        _solver_name = str(sample_solver).lower().strip()
 
 
         #--------------------------------------Step 2: generate--------------------------------------
@@ -1323,27 +1339,41 @@ class WanS2V:
                         self._sampler_sigmas = None
 
                     if getattr(self, '_sampler_timesteps', None) is None:
-                        # Prefer passing `shift` into our local few-step schedulers.
-                        try:
-                            sample_scheduler.set_timesteps(
-                                int(sampling_steps), device=self.device, shift=float(shift)
+                        if _solver_name in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                            # The real `fewstep_fm` uses a fixed 4-step schedule (ported from avatar_lab).
+                            denoising_timesteps = [999, 748, 502, 247]
+                            den_idx = self.num_train_timesteps - torch.tensor(
+                                denoising_timesteps, dtype=torch.long
                             )
-                        except TypeError:
-                            sample_scheduler.set_timesteps(
-                                int(sampling_steps), device=self.device
-                            )
-                        self._sampler_timesteps = sample_scheduler.timesteps
-                        self._sampler_sigmas = getattr(sample_scheduler, "sigmas", None)
+                            self._sampler_timesteps = sample_scheduler.timesteps[den_idx].to(self.device)
+                            self._sampler_sigmas = None
+                        else:
+                            # Prefer passing `shift` into our local few-step schedulers.
+                            try:
+                                sample_scheduler.set_timesteps(
+                                    int(sampling_steps), device=self.device, shift=float(shift)
+                                )
+                            except TypeError:
+                                sample_scheduler.set_timesteps(
+                                    int(sampling_steps), device=self.device
+                                )
+                            self._sampler_timesteps = sample_scheduler.timesteps
+                            self._sampler_sigmas = getattr(sample_scheduler, "sigmas", None)
 
                     timesteps = self._sampler_timesteps
                     sample_scheduler.timesteps = timesteps
                     if getattr(self, '_sampler_sigmas', None) is not None and hasattr(sample_scheduler, "sigmas"):
                         sample_scheduler.sigmas = self._sampler_sigmas
-                    sample_scheduler._step_index = dist.get_rank() if dist.is_initialized() else 0
-                    sample_scheduler._begin_index = 0
+
+                    if hasattr(sample_scheduler, "_step_index"):
+                        sample_scheduler._step_index = dist.get_rank() if dist.is_initialized() else 0
+                    if hasattr(sample_scheduler, "_begin_index"):
+                        sample_scheduler._begin_index = 0
 
                     block_latents = clip_latents[0][:, block_index *
                                 self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
+                    block_noise = clip_noise[0][:, block_index *
+                                self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block]
                     block_frames = self.num_frames_per_block * vae_t
                     left_idx = block_index * block_frames
                     right_idx = (block_index + 1) * block_frames
@@ -1383,13 +1413,33 @@ class WanS2V:
 
                         noise_pred = [torch.cat(noise_pred_cond, dim=0)]
                         self._move_kv_cache_to_working_gpu(i+1,i+1)# i+1 gpu -> 0
-                        temp_x0 = sample_scheduler.step(
-                            noise_pred[0].unsqueeze(0),# [16,f,h,w]
-                            t,
-                            latent_model_input.unsqueeze(0), #[1,16,f,h,w]
-                            return_dict=False,
-                            generator=seed_g)[0]
-                        block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
+
+                        if _solver_name in ("fewstep_fm", "few_step_fm", "fewstep-fm"):
+                            # `fewstep_fm`: convert flow_pred -> x0_pred, then re-noise to the next timestep.
+                            t_tensor = t
+                            if not isinstance(t_tensor, torch.Tensor):
+                                t_tensor = torch.tensor(float(t), device=latent_model_input.device)
+                            sigma_t = (t_tensor.to(dtype=latent_model_input.dtype, device=latent_model_input.device) /
+                                       float(self.num_train_timesteps))
+                            while sigma_t.ndim < latent_model_input.ndim:
+                                sigma_t = sigma_t.unsqueeze(-1)
+                            x0_pred = latent_model_input - sigma_t * noise_pred[0]
+
+                            if i < len(timesteps) - 1:
+                                next_t = timesteps[i + 1]
+                                block_latents = sample_scheduler.add_noise(
+                                    x0_pred, block_noise, next_t
+                                ).to(dtype=latent_model_input.dtype, device=latent_model_input.device)
+                            else:
+                                block_latents = x0_pred
+                        else:
+                            temp_x0 = sample_scheduler.step(
+                                noise_pred[0].unsqueeze(0),# [16,f,h,w]
+                                t,
+                                latent_model_input.unsqueeze(0), #[1,16,f,h,w]
+                                return_dict=False,
+                                generator=seed_g)[0]
+                            block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
                     
                     clip_output[:, block_index * self.num_frames_per_block:(
                         block_index + 1) * self.num_frames_per_block] = block_latents #[16,num_frames_per_block,h,w]

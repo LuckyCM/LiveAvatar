@@ -395,11 +395,7 @@ def initialize_pipeline(args, training_settings):
         init_distributed_group()
     
     cfg = WAN_CONFIGS[args.task]
-    if args.sample_solver == "fewstep_fm":
-        cfg = copy.deepcopy(cfg)
-        cfg.sample_solver = "euler"
-        logging.info("sample_solver=fewstep_fm mapped to cfg.sample_solver=euler")
-    elif hasattr(cfg, "sample_solver") and args.sample_solver != cfg.sample_solver:
+    if hasattr(cfg, "sample_solver") and args.sample_solver != cfg.sample_solver:
         cfg = copy.deepcopy(cfg)
         cfg.sample_solver = args.sample_solver
     

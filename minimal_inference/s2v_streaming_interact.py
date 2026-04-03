@@ -482,13 +482,8 @@ def generate(args, training_settings):
 
     cfg = WAN_CONFIGS[args.task]
 
-    # Map external solver name to internal scheduler selection
-    if args.sample_solver == "fewstep_fm":
-        # Repo currently supports FlowMatchEuler/UniPC/DPM++; fewstep_fm is treated as Euler FM.
-        cfg = copy.deepcopy(cfg)
-        cfg.sample_solver = "euler"
-        logging.info("sample_solver=fewstep_fm mapped to cfg.sample_solver=euler")
-    elif hasattr(cfg, "sample_solver") and args.sample_solver != cfg.sample_solver:
+    # Map CLI solver name to config
+    if hasattr(cfg, "sample_solver") and args.sample_solver != cfg.sample_solver:
         cfg = copy.deepcopy(cfg)
         cfg.sample_solver = args.sample_solver
     if args.ulysses_size > 1:
