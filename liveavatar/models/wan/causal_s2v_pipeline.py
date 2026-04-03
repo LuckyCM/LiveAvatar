@@ -227,7 +227,7 @@ class WanS2V:
 
         约束：不要在流水线最外层整体 compile `self.noise_model`。
         这里仅负责：
-        - 获取 TorchAir backend（jit_compile="auto"）
+        - 获取 TorchAir backend（Graph Mode, dynamic=False）
         - 触发 `CausalWanModel_S2V.enable_safe_torch_compile()` 去编译真正的高负载纯计算子模块
 
         说明：NPU 运行时兼容性 patch（用于规避 Triton/CUDA 探测崩溃）已在
@@ -237,6 +237,15 @@ class WanS2V:
         """
         if getattr(self, "_npu_torch_compile_done", False):
             return
+
+        # 允许通过环境变量显式关闭编译（与脚本中的 ENABLE_COMPILE 开关对齐）。
+        flag = str(os.getenv("ENABLE_COMPILE", "true")).strip().lower()
+        if flag in ("0", "false", "no", "off"):
+            print("[TorchAir] ENABLE_COMPILE=false，跳过 NPU torch.compile 注入")
+            self._npu_torch_compile_done = True
+            return
+
+        # Only enable on NPU runtime.
         # Only enable on NPU runtime.
         if str(getattr(self, "device_type", "")) != "npu" and getattr(self.device, "type", "") != "npu":
             return
@@ -248,20 +257,21 @@ class WanS2V:
         try:
             import torchair  # type: ignore
 
-            # 参考 avatar_lab 的配置：通过 CompilerConfig 打开 jit_compile="auto" 以选择 NPU backend。
+            # 使用 TorchAir NPU backend；CompilerConfig 由 torchair 提供。
             if hasattr(torchair, "CompilerConfig"):
                 cfg = torchair.CompilerConfig()
                 try:
+                    # 保持与 avatar_lab 一致的行为：按需开启 JIT 编译。
                     cfg.experimental_config.jit_compile = "auto"
                 except Exception:
                     pass
-                # Newer TorchAir API
+                # 优先使用 get_npu_backend（新接口）。
                 if hasattr(torchair, "get_npu_backend"):
                     try:
                         backend = torchair.get_npu_backend(compiler_config=cfg)
                     except TypeError:
                         backend = torchair.get_npu_backend(cfg)
-                # Compatibility: some builds only expose get_compiler()
+                # 兼容旧版本仅暴露 get_compiler 的情况。
                 if backend is None and hasattr(torchair, "get_compiler"):
                     try:
                         backend = torchair.get_compiler(config=cfg)

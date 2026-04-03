@@ -771,34 +771,43 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         """
         if self._safe_compile_enabled:
             return
+        # 标记为已尝试，避免在推理循环中多次触发编译逻辑。
         self._safe_compile_enabled = True
 
-        if backend is None:
-            # TorchAir backend 不可用时，允许走原生 "npu" 或其它 backend（由上层决定）。
-            backend = "npu"
-        if not hasattr(torch, "compile"):
+        # 若上层未提供 backend（例如 TorchAir NPU backend），或当前 PyTorch 不支持 torch.compile，
+        # 则保持 eager 执行以保证稳定性。
+        if backend is None or not hasattr(torch, "compile"):
             return
+
+        def _safe_compile(target):
+            """Best-effort 包装 torch.compile，优先使用 Graph Mode (dynamic=False)。"""
+            if target is None:
+                return None
+            try:
+                # Ascend NPU / TorchAir 推荐使用 dynamic=False 以获得稳定的 Graph Mode。
+                return torch.compile(target, backend=backend, dynamic=False)
+            except TypeError:
+                # 兼容旧版 PyTorch 不支持 dynamic 参数的情况。
+                try:
+                    return torch.compile(target, backend=backend)
+                except Exception:
+                    return None
+            except Exception:
+                return None
 
         # 只对 blocks 内部纯计算做编译，避免 dict/控制流参与 tracing。
         for blk in getattr(self, "blocks", []):
-            try:
-                blk._compiled_cross_attn = torch.compile(blk.cross_attn, backend=backend, dynamic=True)
-            except Exception:
-                blk._compiled_cross_attn = None
-            try:
-                blk._compiled_ffn = torch.compile(blk.ffn, backend=backend, dynamic=True)
-            except Exception:
-                blk._compiled_ffn = None
+            blk._compiled_cross_attn = _safe_compile(getattr(blk, "cross_attn", None))
+            blk._compiled_ffn = _safe_compile(getattr(blk, "ffn", None))
 
             # Self-attn 的 KV cache 写入/分支较多，只编译 QKV 投影这一段。
-            try:
-                if hasattr(blk, "self_attn") and hasattr(blk.self_attn, "_qkv"):
-                    blk.self_attn._compiled_qkv = torch.compile(blk.self_attn._qkv, backend=backend, dynamic=True)
-            except Exception:
-                # Best-effort
+            self_attn = getattr(blk, "self_attn", None)
+            if self_attn is not None and hasattr(self_attn, "_qkv"):
+                compiled_qkv = _safe_compile(self_attn._qkv)
                 try:
-                    blk.self_attn._compiled_qkv = None
+                    self_attn._compiled_qkv = compiled_qkv
                 except Exception:
+                    # Best-effort：即使属性写入失败也不影响主推理路径。
                     pass
 
     def _rope_max_index_from_grid_sizes(self, grid_sizes) -> int:
