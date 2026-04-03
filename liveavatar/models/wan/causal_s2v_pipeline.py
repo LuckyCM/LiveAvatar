@@ -225,9 +225,11 @@ class WanS2V:
 
         约束：不要在流水线最外层整体 compile `self.noise_model`。
         这里仅负责：
-        - 注入 NPU + Dynamo 兼容性 patch
         - 获取 TorchAir backend（jit_compile="auto"）
         - 触发 `CausalWanModel_S2V.enable_safe_torch_compile()` 去编译真正的高负载纯计算子模块
+
+        说明：NPU 运行时兼容性 patch（用于规避 Triton/CUDA 探测崩溃）已在
+        `liveavatar.utils.device_backend.set_device()` 统一注入。
 
         NOTE: 仍然保持 lazy 行为，确保模型已放到 NPU。
         """
