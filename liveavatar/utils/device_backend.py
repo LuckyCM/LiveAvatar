@@ -8,6 +8,125 @@ import torch
 DeviceBackend = Literal["auto", "cuda", "npu", "cpu"]
 
 
+_NPU_RUNTIME_COMPAT_PATCHED = False
+
+
+def apply_npu_runtime_compat_patches() -> bool:
+    """Apply best-effort runtime compatibility patches for Ascend NPU.
+
+    背景：部分 PyTorch/Dynamo/Triton（torch.utils._triton）在初始化/探测 CUDA 能力时
+    会调用 `torch.cuda.get_device_capability()` / `torch.cuda.get_device_properties()`。
+    在 Ascend NPU 环境中，这些接口可能抛异常或返回 None，从而导致比较报错，甚至在
+    torch.compile / Dynamo 期间触发崩溃。
+
+    本函数集中做 NPU 场景下的兼容性 Monkey Patch（幂等）：
+    - 强制 Triton 相关探测返回 False，避免误入 CUDA/TMA 分支
+    - 兜底 CUDA capability / properties，避免 None/异常参与比较（默认回退为 (8, 0)）
+
+    Returns:
+        bool: True 表示已在当前进程中应用（或曾应用）；False 表示未应用（例如 torch.cuda 不存在）。
+    """
+
+    global _NPU_RUNTIME_COMPAT_PATCHED
+    if _NPU_RUNTIME_COMPAT_PATCHED:
+        return True
+
+    # Ensure torch.npu exists when running on Ascend.
+    if not hasattr(torch, "npu"):
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:
+            pass
+
+    # 1) Force Triton availability checks to False on NPU.
+    try:
+        import torch.utils._triton as _triton  # type: ignore
+
+        if hasattr(_triton, "has_triton"):
+            _triton.has_triton = lambda: False  # type: ignore[assignment]
+        if hasattr(_triton, "has_triton_experimental_host_tma"):
+            _triton.has_triton_experimental_host_tma = lambda: False  # type: ignore[assignment]
+        if hasattr(_triton, "_device_supports_tma"):
+            _triton._device_supports_tma = lambda *args, **kwargs: False  # type: ignore[assignment]
+    except Exception:
+        # Torch builds without _triton are OK.
+        pass
+
+    # 2) Fallback patch for torch.cuda.get_device_capability() returning None / raising.
+    try:
+        cuda = getattr(torch, "cuda", None)
+        original_cap = getattr(cuda, "get_device_capability", None) if cuda is not None else None
+        if callable(original_cap):
+            def patched_cap(*args, **kwargs):
+                try:
+                    res = original_cap(*args, **kwargs)
+                except Exception:
+                    res = None
+                # 在 NPU 场景下兜底为 (8, 0)：
+                # - 保证是可比较的 tuple
+                # - 同时对 Hopper/TMA(>=9.0) 等分支保持 False
+                if not (isinstance(res, tuple) and len(res) >= 2 and res[0] is not None and res[1] is not None):
+                    return (8, 0)
+                try:
+                    return (int(res[0]), int(res[1]))
+                except Exception:
+                    return (8, 0)
+
+            cuda.get_device_capability = patched_cap  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    # 3) Fallback patch for get_device_properties().major/minor being None / raising.
+    try:
+        cuda = getattr(torch, "cuda", None)
+        original_props = getattr(cuda, "get_device_properties", None) if cuda is not None else None
+        if callable(original_props):
+            from types import SimpleNamespace
+
+            class _CudaPropsProxy:
+                def __init__(self, p):
+                    self._p = p
+
+                @property
+                def major(self):
+                    v = getattr(self._p, "major", None)
+                    return int(v) if v is not None else 8
+
+                @property
+                def minor(self):
+                    v = getattr(self._p, "minor", None)
+                    return int(v) if v is not None else 0
+
+                def __getattr__(self, name):
+                    return getattr(self._p, name)
+
+            def patched_get_device_properties(*args, **kwargs):
+                try:
+                    p = original_props(*args, **kwargs)
+                except Exception:
+                    return SimpleNamespace(major=8, minor=0)
+
+                if p is None:
+                    return SimpleNamespace(major=8, minor=0)
+
+                if getattr(p, "major", None) is None or getattr(p, "minor", None) is None:
+                    return _CudaPropsProxy(p)
+                # best-effort normalize
+                try:
+                    _ = int(getattr(p, "major"))
+                    _ = int(getattr(p, "minor"))
+                except Exception:
+                    return _CudaPropsProxy(p)
+                return p
+
+            cuda.get_device_properties = patched_get_device_properties  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    _NPU_RUNTIME_COMPAT_PATCHED = True
+    return True
+
+
 def _has_torch_npu() -> bool:
     try:
         import torch_npu  # noqa: F401
@@ -55,6 +174,8 @@ def set_device(local_rank: int, backend: DeviceBackend) -> None:
     if backend == "npu":
         # import torch_npu first to ensure torch.npu exists
         import torch_npu  # noqa: F401
+        # NPU runtime compat patches must be applied before any torch.compile/Triton probing.
+        apply_npu_runtime_compat_patches()
         torch.npu.set_device(local_rank)
         return
     if backend == "cuda":

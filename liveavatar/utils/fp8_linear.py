@@ -4,15 +4,7 @@ import math
 import logging
 logger = logging.getLogger()
 
-# NPU 上 `@torch.compile` 装饰器会在模块 import 时立即触发 Dynamo/Triton 探测；
-# 必须在这里（装饰器执行前）就完成 monkey patch。
-try:
-    from liveavatar.models.wan.inference_utils import patch_torch_compile_for_npu
-
-    patch_torch_compile_for_npu()
-except Exception:
-    # best-effort
-    pass
+# NPU 下的 torch.compile 兼容 patch 由 `liveavatar.utils.device_backend.set_device()` 统一注入。
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)

@@ -240,15 +240,6 @@ class WanS2V:
             print("[TorchAir] torch.compile 不可用，跳过 NPU torch.compile 注入")
             self._npu_torch_compile_done = True
             return
-
-        # Patch Dynamo/Triton CUDA feature checks for Ascend NPU before torch.compile.
-        try:
-            from .inference_utils import patch_torch_compile_for_npu
-
-            patch_torch_compile_for_npu()
-        except Exception as e:
-            # Patch is best-effort; if it fails we still try compile and fall back later.
-            print(f"[TorchAir] NPU torch.compile 兼容性 patch 注入失败（忽略）: {e}")
         backend = None
         try:
             import torchair  # type: ignore
