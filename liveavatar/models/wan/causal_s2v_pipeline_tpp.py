@@ -153,16 +153,18 @@ class WanS2V:
             self.scheduler = FlowMatchScheduler_Omni(shift=5, sigma_min=0.0, extra_one_step=True)
             self.scheduler.set_timesteps(1000, training=True)
         else:
-            if config.sample_solver == 'euler':
+            # Backward-compat: some runners still pass `fewstep_fm`.
+            _cfg_solver = str(getattr(config, "sample_solver", "")).lower().strip()
+            if _cfg_solver in ('euler', 'fewstep_fm', 'few_step_fm', 'fewstep-fm'):
                 self.sample_scheduler = FlowMatchEulerDiscreteScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=3)
-            elif config.sample_solver == 'unipc':#default
+            elif _cfg_solver == 'unipc':#default
                 self.sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
                     use_dynamic_shifting=False)
-            elif config.sample_solver == 'dpm++':
+            elif _cfg_solver == 'dpm++':
                 self.sample_scheduler = FlowDPMSolverMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
@@ -1024,7 +1026,8 @@ class WanS2V:
         dataset_info = {}
 
         print("complete prepare conditional inputs")
-        if sample_solver == 'euler':#default
+        _sample_solver = str(sample_solver).lower().strip()
+        if _sample_solver in ('euler', 'fewstep_fm', 'few_step_fm', 'fewstep-fm'):#default
             sample_scheduler = FlowMatchEulerDiscreteScheduler(
                 num_train_timesteps=self.num_train_timesteps,
                 shift=3)
