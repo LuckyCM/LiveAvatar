@@ -1,7 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
-
-from liveavatar.models.wan.inference_utils import conditional_compile
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
@@ -765,7 +763,6 @@ class WanVAE:
                 for u in videos
             ]
 
-    @conditional_compile
     def stream_decode(self, zs):
         with amp.autocast(dtype=self.dtype):
             return [

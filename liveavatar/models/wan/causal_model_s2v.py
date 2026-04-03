@@ -47,7 +47,6 @@ from liveavatar.models.wan.wan_2_2.modules.s2v.s2v_utils import rope_precompute
 from liveavatar.models.wan.wan_2_2.distributed import util as dist_util
 from liveavatar.models.wan.wan_2_2.distributed.util import all_to_all,pad_chunk
 import torch.distributed as dist
-from liveavatar.models.wan.inference_utils import conditional_compile
 
 
 def _round_up(x: int, multiple: int = 128) -> int:
@@ -142,13 +141,16 @@ def sp_attn_forward_s2v(self,
         def half(x,dtype=torch.bfloat16):
             return x if x.dtype in half_dtypes else x.to(dtype)
 
-        # query, key, value function
-        def qkv_fn(x):
+        # query, key, value function (pure Tensor path)
+        compiled_qkv = getattr(self, "_compiled_qkv", None)
+        if compiled_qkv is not None and not torch.is_grad_enabled():
+            q, k, v = compiled_qkv(x)
+        elif hasattr(self, "_qkv"):
+            q, k, v = self._qkv(x)
+        else:
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
-            return q, k, v
-        q, k, v = qkv_fn(x)
 
         # Static KV cache may keep Q/K/V padded to a fixed length, while RoPE freqs
         # can be generated/sliced by effective k_lens. Always align to current seq len.
@@ -326,6 +328,15 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         super().__init__(dim, num_heads, window_size, qk_norm, eps)
         self.local_attn_size = local_attn_size
 
+    def _qkv(self, x: torch.Tensor):
+        """纯 Tensor 路径的 QKV 线性投影（适合作为 torch.compile 的最小“骨架”单元）。"""
+        b, s = x.shape[0], x.shape[1]
+        n, d = self.num_heads, self.head_dim
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
+        return q, k, v
+
     def forward(
         self,
         x,
@@ -349,13 +360,11 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
-        q, k, v = qkv_fn(x)
+        compiled_qkv = getattr(self, "_compiled_qkv", None)
+        if compiled_qkv is not None and not torch.is_grad_enabled():
+            q, k, v = compiled_qkv(x)
+        else:
+            q, k, v = self._qkv(x)
         
         if kv_cache is None:
             assert False, "not implemented for self-forcing"
@@ -571,11 +580,21 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x.to(torch.bfloat16)).type_as(bf_dtype_tensor), context, context_lens)
+            cross_attn_mod = getattr(self, "_compiled_cross_attn", None)
+            if cross_attn_mod is None or torch.is_grad_enabled():
+                cross_attn_mod = self.cross_attn
+            x = x + cross_attn_mod(
+                self.norm3(x.to(torch.bfloat16)).type_as(bf_dtype_tensor),
+                context,
+                context_lens,
+            )
             norm2_x = self.norm2(x).float()
             norm2_x = norm2_x * (1+e[4]) + e[3]
             
-            y = self.ffn(norm2_x.type_as(bf_dtype_tensor))
+            ffn_mod = getattr(self, "_compiled_ffn", None)
+            if ffn_mod is None or torch.is_grad_enabled():
+                ffn_mod = self.ffn
+            y = ffn_mod(norm2_x.type_as(bf_dtype_tensor))
 
             x = x + (y.float() * e[5]).type_as(x)
             return x
@@ -739,6 +758,48 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         self.block_mask = None
         self.num_frame_per_block = 1 #只影响训练时causal mask的行为，推理无关
+
+        # Lazy torch.compile wrappers (NPU friendly, block-wise safe strategy).
+        self._safe_compile_enabled = False
+
+    def enable_safe_torch_compile(self, backend=None) -> None:
+        """按“分块折中”策略对真正高负载的纯计算子模块做 torch.compile。
+
+        设计目标：
+        - 避免把整图（包含 KV cache / 动态 mask / 大量分支）丢给 Dynamo 导致 Graph break/Guards 风暴。
+        - 仅编译纯 Tensor/密集算子路径（QKV 投影、cross-attn、FFN），外层 KV 管理与控制流保持 eager。
+        """
+        if self._safe_compile_enabled:
+            return
+        self._safe_compile_enabled = True
+
+        if backend is None:
+            # TorchAir backend 不可用时，允许走原生 "npu" 或其它 backend（由上层决定）。
+            backend = "npu"
+        if not hasattr(torch, "compile"):
+            return
+
+        # 只对 blocks 内部纯计算做编译，避免 dict/控制流参与 tracing。
+        for blk in getattr(self, "blocks", []):
+            try:
+                blk._compiled_cross_attn = torch.compile(blk.cross_attn, backend=backend, dynamic=True)
+            except Exception:
+                blk._compiled_cross_attn = None
+            try:
+                blk._compiled_ffn = torch.compile(blk.ffn, backend=backend, dynamic=True)
+            except Exception:
+                blk._compiled_ffn = None
+
+            # Self-attn 的 KV cache 写入/分支较多，只编译 QKV 投影这一段。
+            try:
+                if hasattr(blk, "self_attn") and hasattr(blk.self_attn, "_qkv"):
+                    blk.self_attn._compiled_qkv = torch.compile(blk.self_attn._qkv, backend=backend, dynamic=True)
+            except Exception:
+                # Best-effort
+                try:
+                    blk.self_attn._compiled_qkv = None
+                except Exception:
+                    pass
 
     def _rope_max_index_from_grid_sizes(self, grid_sizes) -> int:
         """Upper-bound RoPE index needed by `rope_precompute`."""
@@ -1241,7 +1302,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         return [n for n in torch.zeros_like(cond_states)]
 
 
-    @conditional_compile
     def _forward_inference(
             self,
             x,

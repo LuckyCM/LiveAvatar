@@ -32,7 +32,6 @@ from ..model import (
 from .audio_utils import AudioInjector_WAN, CausalAudioEncoder
 from .motioner import FramePackMotioner, MotionerTransformers
 from .s2v_utils import rope_precompute
-from ....inference_utils import conditional_compile
 
 
 def zero_module(module):
@@ -164,7 +163,6 @@ class WanStaticKVCache:
         self.v_cache[layer].scatter_(1, idx, v)
 
 @amp.autocast(enabled=False)
-@conditional_compile
 def rope_apply(x, grid_sizes, cos, sin, start=None):
     """Apply RoPE using pure real cos/sin.
 
@@ -209,7 +207,6 @@ def rope_apply(x, grid_sizes, cos, sin, start=None):
     return torch.stack(output).float()
 
 @amp.autocast(enabled=False)
-@conditional_compile
 def rope_apply_cond(x, grid_sizes, cos, sin, start=None):
     # Kept for compatibility with existing call sites.
     return rope_apply(x, grid_sizes, cos, sin, start=start)

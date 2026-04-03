@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from ...inference_utils import conditional_compile
 from .attention import flash_attention
 from liveavatar.utils.device_backend import autocast as device_autocast
 
@@ -37,7 +36,6 @@ def rope_params(max_seq_len, dim, theta=10000):
     angles = torch.outer(positions, inv_freq)
     return torch.cos(angles), torch.sin(angles)
 
-@conditional_compile
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 

@@ -221,9 +221,15 @@ class WanS2V:
         return f"{self.device.type}:{idx}"
 
     def _maybe_enable_npu_torch_compile(self):
-        """Enable torch.compile with TorchAir backend (NPU) to dump captured graphs.
+        """在 NPU 上按“分块折中”策略启用 torch.compile。
 
-        NOTE: We compile lazily to ensure the model has been moved to NPU already.
+        约束：不要在流水线最外层整体 compile `self.noise_model`。
+        这里仅负责：
+        - 注入 NPU + Dynamo 兼容性 patch
+        - 获取 TorchAir backend（jit_compile="auto"）
+        - 触发 `CausalWanModel_S2V.enable_safe_torch_compile()` 去编译真正的高负载纯计算子模块
+
+        NOTE: 仍然保持 lazy 行为，确保模型已放到 NPU。
         """
         if getattr(self, "_npu_torch_compile_done", False):
             return
@@ -243,53 +249,41 @@ class WanS2V:
         except Exception as e:
             # Patch is best-effort; if it fails we still try compile and fall back later.
             print(f"[TorchAir] NPU torch.compile 兼容性 patch 注入失败（忽略）: {e}")
+        backend = None
         try:
             import torchair  # type: ignore
-        except Exception as e:
-            print(f"[TorchAir] torchair import 失败，跳过 NPU torch.compile 注入: {e}")
-            self._npu_torch_compile_done = True
-            return
 
-        try:
-            # TorchAir API may differ across versions. Some versions don't accept
-            # `config=` kwarg for `get_compiler`, while others do.
-            config = None
+            # 参考 avatar_lab 的配置：通过 CompilerConfig 打开 jit_compile="auto" 以选择 NPU backend。
             if hasattr(torchair, "CompilerConfig"):
-                config = torchair.CompilerConfig()
+                cfg = torchair.CompilerConfig()
                 try:
-                    # Optional debug knob (may not exist in some builds)
-                    config.debug.graph_dump.type = "pbtxt"
+                    cfg.experimental_config.jit_compile = "auto"
                 except Exception:
                     pass
-
-            npu_backend = None
-            if hasattr(torchair, "get_compiler"):
-                try:
-                    # Newer TorchAir
-                    npu_backend = torchair.get_compiler(config=config) if config is not None else torchair.get_compiler()
-                except TypeError:
-                    # Older TorchAir: positional config or different kw names
-                    if config is not None:
+                # Newer TorchAir API
+                if hasattr(torchair, "get_npu_backend"):
+                    try:
+                        backend = torchair.get_npu_backend(compiler_config=cfg)
+                    except TypeError:
+                        backend = torchair.get_npu_backend(cfg)
+                # Compatibility: some builds only expose get_compiler()
+                if backend is None and hasattr(torchair, "get_compiler"):
+                    try:
+                        backend = torchair.get_compiler(config=cfg)
+                    except TypeError:
                         try:
-                            npu_backend = torchair.get_compiler(config)
+                            backend = torchair.get_compiler(cfg)
                         except TypeError:
-                            for kw in ("compiler_config", "cfg"):
-                                try:
-                                    npu_backend = torchair.get_compiler(**{kw: config})
-                                    break
-                                except TypeError:
-                                    continue
-
-            # If TorchAir backend is unavailable, fall back to plain NPU backend.
-            backend = npu_backend if npu_backend is not None else "npu"
-
-            print("==== 强行开启 NPU Torch.Compile ====")
-            self.noise_model = torch.compile(self.noise_model, backend=backend, dynamic=True)
+                            backend = None
         except Exception as e:
-            # Keep original behavior if compilation fails.
-            print(f"[TorchAir] NPU torch.compile 注入失败，回退为未编译模型: {e}")
-        finally:
-            self._npu_torch_compile_done = True
+            print(f"[TorchAir] torchair import/配置失败，回退为不启用 compile: {e}")
+
+        # 不在此处整体编译 noise_model；只把真正的高负载子模块 wrap 成 compiled callable。
+        try:
+            self.noise_model.enable_safe_torch_compile(backend=backend)
+        except Exception as e:
+            print(f"[TorchAir] enable_safe_torch_compile 失败，保持 eager: {e}")
+        self._npu_torch_compile_done = True
     
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming", pretrained_lora_path=None, state_dict_converter=None, load_only=False, load_lora_weight_only=False):
         if not load_only:

@@ -1,9 +1,8 @@
 import torch
+
 STREAMING_VAE = True
-# COMPILE = True
-import os
-COMPILE = os.getenv("ENABLE_COMPILE", "true").lower() == "true"
-print(f"COMPILE: {COMPILE}")
+
+# torch.compile 会使用 Dynamo 缓存；这里保持一个较小的上限以避免长时间运行时缓存膨胀。
 torch._dynamo.config.cache_size_limit = 128
 
 # -----------------------------------------------------------------------------
@@ -31,7 +30,14 @@ def patch_torch_compile_for_npu() -> bool:
 
     global _NPU_TORCH_COMPILE_PATCHED
     if _NPU_TORCH_COMPILE_PATCHED:
-        return False
+        return True
+
+    # Ensure `torch.npu` exists when running on Ascend.
+    if not hasattr(torch, "npu"):
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:
+            pass
 
     if not (hasattr(torch, "npu") and getattr(torch.npu, "is_available", lambda: False)()):
         return False
@@ -60,8 +66,8 @@ def patch_torch_compile_for_npu() -> bool:
                     res = original_cap(*args, **kwargs)
                 except Exception:
                     res = None
-                # Return a tuple to avoid NoneType comparisons. (8, 0) keeps TMA paths disabled.
-                return res if res is not None else (8, 0)
+                # Return a tuple to avoid NoneType comparisons and keep CUDA-only paths disabled.
+                return res if res is not None else (0, 0)
 
             torch.cuda.get_device_capability = patched_cap  # type: ignore[assignment]
     except Exception:
@@ -112,17 +118,3 @@ def patch_torch_compile_for_npu() -> bool:
     return True
 
 NO_REFRESH_INFERENCE = False
-
-def is_compile_supported():
-    return hasattr(torch, "compiler") and hasattr(torch.nn.Module, "compile")
-
-def disable(func):
-    if is_compile_supported():
-        return torch.compiler.disable(func)
-    return func
-
-def conditional_compile(func):
-    if COMPILE:
-        return torch.compiler.disable(func)
-    else:
-        return func
