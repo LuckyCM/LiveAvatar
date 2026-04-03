@@ -782,6 +782,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             return
         # 标记为已尝试，避免在推理循环中多次触发编译逻辑。
         self._safe_compile_enabled = True
+        print(f"[TorchAir] enable_safe_torch_compile is called for causal_model_s2v")
 
         # 若上层未提供 backend（例如 TorchAir NPU backend），或当前 PyTorch 不支持 torch.compile，
         # 则保持 eager 执行以保证稳定性。
@@ -805,6 +806,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 return None
 
         # 只对 blocks 内部纯计算做编译，避免 dict/控制流参与 tracing。
+        print(f"[TorchAir] Compiling {len(getattr(self, \"blocks\", []))} blocks using safe torch.compile...")
         for blk in getattr(self, "blocks", []):
             blk._compiled_cross_attn = _safe_compile(getattr(blk, "cross_attn", None))
             blk._compiled_ffn = _safe_compile(getattr(blk, "ffn", None))
