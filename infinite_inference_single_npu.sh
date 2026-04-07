@@ -11,7 +11,10 @@ FFMPEG_DIR=$(python3 -c "import os, imageio_ffmpeg; print(os.path.dirname(imagei
 export PATH="${FFMPEG_DIR}:${PATH}"
 
 # 2. LiveAvatar 兼容的启动命令
-PYTHONUNBUFFERED=1 TORCHDYNAMO_VERBOSE=1 TORCH_LOGS="recompiles,recompiles_verbose,guards,graph_breaks,dynamic,aot_graphs" TORCHAIR_LOG_LEVEL=DEBUG 
+export PYTHONUNBUFFERED=1
+export TORCHDYNAMO_VERBOSE=1
+export TORCH_LOGS="recompiles,recompiles_verbose,guards,graph_breaks,dynamic,aot_graphs"
+export TORCHAIR_LOG_LEVEL=DEBUG
 torchrun --nproc_per_node=1 --master_port=29101 minimal_inference/s2v_streaming_interact.py \
     --task s2v-1.3B \
     --ckpt_dir ./speed_test_1_3B_0327/FidoAvatar_1.3B_0327 \
