@@ -519,6 +519,20 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         self.self_attn = CausalWanS2VSelfAttention(dim, num_heads, window_size,
                                              qk_norm, eps, local_attn_size)
 
+    def _cross_attn_ffn_impl(self, x, context, context_lens, e_3, e_4, e_5, bf_dtype_tensor):
+        x = x + self.cross_attn(
+            self.norm3(x.to(torch.bfloat16)).type_as(bf_dtype_tensor),
+            context,
+            context_lens,
+        )
+        norm2_x = self.norm2(x).float()
+        norm2_x = norm2_x * (1 + e_4) + e_3
+        
+        y = self.ffn(norm2_x.type_as(bf_dtype_tensor))
+        
+        x = x + (y.float() * e_5).type_as(x)
+        return x
+
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens,
         block_mask,frame_seqlen,
         kv_cache=None,
@@ -588,27 +602,11 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         x = x + (y.float() * e[2]).type_as(x)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            cross_attn_mod = getattr(self, "_compiled_cross_attn", None)
-            if cross_attn_mod is None or torch.is_grad_enabled():
-                cross_attn_mod = self.cross_attn
-            x = x + cross_attn_mod(
-                self.norm3(x.to(torch.bfloat16)).type_as(bf_dtype_tensor),
-                context,
-                context_lens,
-            )
-            norm2_x = self.norm2(x).float()
-            norm2_x = norm2_x * (1+e[4]) + e[3]
+        cross_attn_ffn_mod = getattr(self, "_compiled_cross_attn_ffn", None)
+        if cross_attn_ffn_mod is None or torch.is_grad_enabled():
+            cross_attn_ffn_mod = self._cross_attn_ffn_impl
             
-            ffn_mod = getattr(self, "_compiled_ffn", None)
-            if ffn_mod is None or torch.is_grad_enabled():
-                ffn_mod = self.ffn
-            y = ffn_mod(norm2_x.type_as(bf_dtype_tensor))
-
-            x = x + (y.float() * e[5]).type_as(x)
-            return x
-
-        x = cross_attn_ffn(x, context, context_lens, e).type_as(bf_dtype_tensor)
+        x = cross_attn_ffn_mod(x, context, context_lens, e[3], e[4], e[5], bf_dtype_tensor).type_as(bf_dtype_tensor)
         return x
 
 
@@ -808,6 +806,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # 只对 blocks 内部纯计算做编译，避免 dict/控制流参与 tracing。
         print(f"[TorchAir] Compiling {len(getattr(self, \"blocks\", []))} blocks using safe torch.compile...")
         for blk in getattr(self, "blocks", []):
+            blk._compiled_cross_attn_ffn = _safe_compile(getattr(blk, "_cross_attn_ffn_impl", None))
             blk._compiled_cross_attn = _safe_compile(getattr(blk, "cross_attn", None))
             blk._compiled_ffn = _safe_compile(getattr(blk, "ffn", None))
 
